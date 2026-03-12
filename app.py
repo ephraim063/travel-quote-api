@@ -5,7 +5,7 @@
 
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
-from pdf_generator_v2 import (
+from pdf_generator import (
     generate_quote_pdf,
     generate_receipt_pdf,
     generate_accommodation_voucher,
