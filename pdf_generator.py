@@ -1104,34 +1104,55 @@ def generate_receipt_pdf(data):
 # ══════════════════════════════════════════════════════════════════
 
 def generate_accommodation_voucher(data):
+    """
+    Generates accommodation voucher in one of two states:
+ 
+    RESERVED (voucher_status = "reserved"):
+      - Agent contact shown — supplier contact hidden
+      - Provisional booking banner (amber)
+      - Rider: full confirmation ref provided on final payment
+ 
+    CONFIRMED (voucher_status = "confirmed"):
+      - Supplier contact revealed
+      - Confirmed booking banner (green)
+      - Supplier confirmation reference shown
+      - Full check-in instructions
+    """
     buffer   = io.BytesIO()
     styles   = S()
-    agency   = data.get("agency_name", "SafariFlow")
+    agency   = data.get("agency_name", "SafariDesk")
     ag_email = data.get("agent_email", "")
-
+ 
+    # ── Determine voucher status ──────────────────────────────────
+    voucher_status = data.get("voucher_status", "reserved").lower()
+    is_confirmed   = voucher_status == "confirmed"
+ 
     doc = BaseDocTemplate(
         buffer, pagesize=A4,
         leftMargin=MARGIN, rightMargin=MARGIN,
         topMargin=26*mm, bottomMargin=20*mm,
     )
-    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="main")
+    frame    = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="main")
     template = PageTemplate(
         id="main", frames=[frame],
         onPage=lambda c, d: draw_page(c, d, agency, ag_email, "ACCOMMODATION VOUCHER")
     )
     doc.addPageTemplates([template])
     story = []
-
-    # Voucher header
+ 
+    # ── Voucher Header ────────────────────────────────────────────
     vchr_hdr = Table([[
-        Paragraph("&#x1F3E8; ACCOMMODATION VOUCHER",
+        Paragraph(
+            "&#x2705; ACCOMMODATION VOUCHER" if is_confirmed
+            else "&#x1F3E8; ACCOMMODATION VOUCHER",
             ParagraphStyle("vh", fontSize=16, fontName="Helvetica-Bold",
-            textColor=WHITE, leading=22)),
+            textColor=WHITE, leading=22)
+        ),
         Table([
             [Paragraph("VOUCHER NUMBER", styles["label"])],
             [Paragraph(data.get("voucher_number", "—"), styles["value_gold"])],
-        ], colWidths=[INNER_W*0.35]),
-    ]], colWidths=[INNER_W*0.65, INNER_W*0.35])
+        ], colWidths=[INNER_W * 0.35]),
+    ]], colWidths=[INNER_W * 0.65, INNER_W * 0.35])
     vchr_hdr.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,-1), NAVY),
         ("LEFTPADDING", (0,0), (-1,-1), 16),
@@ -1143,12 +1164,60 @@ def generate_accommodation_voucher(data):
         ("LINEBEFORE", (1,0), (1,0), 1, colors.HexColor("#2A4A6A")),
     ]))
     story.append(vchr_hdr)
+    story.append(Spacer(1, 4*mm))
+ 
+    # ── Status Banner ─────────────────────────────────────────────
+    if is_confirmed:
+        status_bg   = GREEN_BG
+        status_border = GREEN
+        status_icon = "&#x2705;"
+        status_title = "CONFIRMED BOOKING"
+        status_text = (
+            f"This booking is fully confirmed. "
+            f"Supplier Confirmation Reference: "
+            f"<b>{data.get('confirmation_reference', '—')}</b>"
+        )
+        status_style = styles["confirmed_text"]
+    else:
+        status_bg     = AMBER_BG
+        status_border = AMBER
+        status_icon   = "&#x26A0;"
+        status_title  = "PROVISIONAL BOOKING"
+        status_text   = (
+            "This is a provisional reservation. Your full confirmation reference "
+            "will be provided upon receipt of final payment. For any queries "
+            "regarding this booking, please contact your travel specialist below."
+        )
+        status_style = styles["provisional_text"]
+ 
+    status_banner = Table([[
+        Table([
+            [Paragraph(
+                f"{status_icon}  {status_title}",
+                ParagraphStyle("sb_title", fontSize=11, fontName="Helvetica-Bold",
+                    textColor=status_border, leading=16)
+            )],
+            [Spacer(1, 3)],
+            [Paragraph(status_text, status_style)],
+        ], colWidths=[INNER_W - 28])
+    ]], colWidths=[INNER_W])
+    status_banner.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), status_bg),
+        ("LEFTPADDING", (0,0), (-1,-1), 14),
+        ("RIGHTPADDING", (0,0), (-1,-1), 14),
+        ("TOPPADDING", (0,0), (-1,-1), 12),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 12),
+        ("LINEBEFORE", (0,0), (-1,-1), 4, status_border),
+        ("LINEBELOW", (0,-1), (-1,-1), 1, status_border),
+        ("LINEABOVE", (0,0), (-1,0), 1, status_border),
+    ]))
+    story.append(status_banner)
     story.append(Spacer(1, 5*mm))
-
-    # Property details
+ 
+    # ── Property Details ──────────────────────────────────────────
     story.append(section_divider(styles, "PROPERTY DETAILS"))
     story.append(Spacer(1, 3*mm))
-
+ 
     prop_rows = [
         ("PROPERTY NAME",    data.get("property_name", "—")),
         ("DESTINATION",      data.get("destination", "—")),
@@ -1159,13 +1228,13 @@ def generate_accommodation_voucher(data):
         ("CHECK-OUT DATE",   data.get("check_out_date", "—")),
         ("NUMBER OF NIGHTS", str(data.get("nights", "—"))),
     ]
-
-    prop_cells_1 = [info_cell(l, v, styles, INNER_W/2)
-                    for l, v in prop_rows[:4]]
-    prop_cells_2 = [info_cell(l, v, styles, INNER_W/2)
-                    for l, v in prop_rows[4:]]
-
-    for cells in [prop_cells_1, prop_cells_2]:
+ 
+    for i in range(0, len(prop_rows), 4):
+        chunk = prop_rows[i:i+4]
+        cells = [info_cell(l, v, styles, INNER_W/4) for l, v in chunk]
+        # Pad to 4 cells if needed
+        while len(cells) < 4:
+            cells.append(Table([[Paragraph("", styles["label"])]], colWidths=[INNER_W/4]))
         t = Table([cells], colWidths=[INNER_W/4]*4)
         t.setStyle(TableStyle([
             ("BACKGROUND", (0,0), (-1,-1), CREAM),
@@ -1179,8 +1248,8 @@ def generate_accommodation_voucher(data):
         ]))
         story.append(t)
     story.append(Spacer(1, 4*mm))
-
-    # Guest names
+ 
+    # ── Guest Names ────────────────────────────────────
     guests = data.get("guest_names", [])
     if guests:
         story.append(section_divider(styles, "GUESTS"))
@@ -1200,17 +1269,34 @@ def generate_accommodation_voucher(data):
         ]))
         story.append(guest_table)
         story.append(Spacer(1, 4*mm))
-
-    # Supplier contact
-    story.append(section_divider(styles, "PROPERTY CONTACT"))
-    story.append(Spacer(1, 3*mm))
-
+ 
+    # ── Contact Section ──────────────────────────────────
+    # RESERVED → show agent contact
+    # CONFIRMED → show supplier contact
     sup_col = INNER_W / 3
-    sup_cells = [
-        info_cell("PROPERTY EMAIL", data.get("supplier_email", "—"), styles, sup_col),
-        info_cell("PROPERTY PHONE", data.get("supplier_phone", "—"), styles, sup_col),
-        info_cell("BOOKING REF", data.get("booking_number", "—"), styles, sup_col),
-    ]
+ 
+    if is_confirmed:
+        story.append(section_divider(styles, "PROPERTY CONTACT"))
+        story.append(Spacer(1, 3*mm))
+        sup_cells = [
+            info_cell("PROPERTY EMAIL",   data.get("supplier_email", "—"), styles, sup_col),
+            info_cell("PROPERTY PHONE",   data.get("supplier_phone", "—"), styles, sup_col),
+            info_cell("CONFIRMATION REF", data.get("confirmation_reference", "—"), styles, sup_col),
+        ]
+        contact_note = "Present this voucher at check-in. Quote your confirmation reference."
+    else:
+        story.append(section_divider(styles, "YOUR TRAVEL SPECIALIST"))
+        story.append(Spacer(1, 3*mm))
+        sup_cells = [
+            info_cell("CONTACT NAME",  data.get("agency_name", "—"), styles, sup_col),
+            info_cell("CONTACT EMAIL", data.get("agent_email", "—"), styles, sup_col),
+            info_cell("CONTACT PHONE", data.get("agent_phone", "—"), styles, sup_col),
+        ]
+        contact_note = (
+            "For all pre-arrival queries, please contact your travel specialist above. "
+            "Direct property contact details will be provided upon full payment confirmation."
+        )
+ 
     sup_table = Table([sup_cells], colWidths=[sup_col]*3)
     sup_table.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,-1), CREAM),
@@ -1222,12 +1308,46 @@ def generate_accommodation_voucher(data):
         ("LINEBELOW", (0,-1),(-1,-1), 1, GOLD),
     ]))
     story.append(sup_table)
+    story.append(Spacer(1, 3*mm))
+ 
+    # Contact instruction note
+    contact_note_table = Table(
+        [[Paragraph(contact_note, styles["note"])]],
+        colWidths=[INNER_W]
+    )
+    contact_note_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), GOLD_BG),
+        ("LEFTPADDING", (0,0), (-1,-1), 14),
+        ("RIGHTPADDING", (0,0), (-1,-1), 14),
+        ("TOPPADDING", (0,0), (-1,-1), 8),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+        ("LINEBEFORE", (0,0), (-1,-1), 3, GOLD),
+    ]))
+    story.append(contact_note_table)
     story.append(Spacer(1, 4*mm))
-
-    # Special notes
-    notes = data.get("special_notes", "")
-    if notes:
-        notes_t = Table([[Paragraph(notes, styles["note"])]], colWidths=[INNER_W])
+ 
+    # ── Booking Ref + Special Notes ──────────────────────────
+    booking_ref = data.get("booking_number", "")
+    special_notes = data.get("special_notes", "")
+ 
+    ref_cells = [
+        info_cell("BOOKING REFERENCE", booking_ref or "—", styles, INNER_W/2),
+        info_cell("ISSUED BY", agency, styles, INNER_W/2),
+    ]
+    ref_table = Table([ref_cells], colWidths=[INNER_W/2]*2)
+    ref_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), WHITE),
+        ("LEFTPADDING", (0,0), (-1,-1), 10),
+        ("TOPPADDING", (0,0), (-1,-1), 8),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+        ("LINEBEFORE", (1,0),(1,-1), 0.5, BORDER),
+        ("LINEBELOW", (0,-1),(-1,-1), 0.5, BORDER),
+    ]))
+    story.append(ref_table)
+ 
+    if special_notes:
+        story.append(Spacer(1, 4*mm))
+        notes_t = Table([[Paragraph(special_notes, styles["note"])]], colWidths=[INNER_W])
         notes_t.setStyle(TableStyle([
             ("BACKGROUND", (0,0), (-1,-1), GOLD_BG),
             ("LEFTPADDING", (0,0), (-1,-1), 14),
@@ -1237,18 +1357,26 @@ def generate_accommodation_voucher(data):
             ("LINEBEFORE", (0,0), (-1,-1), 3, GOLD),
         ]))
         story.append(notes_t)
-        story.append(Spacer(1, 4*mm))
-
-    # Agent footer
+ 
+    story.append(Spacer(1, 4*mm))
+ 
+    # ── Footer ────────────────────────────────────────────────────
+    footer_text = (
+        "This voucher is valid for the dates specified above. Present this voucher at check-in."
+        if is_confirmed else
+        "This is a provisional voucher. Final confirmation details will follow upon full payment."
+    )
     agent_footer = Table([[
-        Paragraph(f"Issued by: {agency}  ·  {ag_email}",
+        Paragraph(
+            f"Issued by: {agency}  ·  {ag_email}",
             ParagraphStyle("af", fontSize=9, fontName="Helvetica-Bold",
-            textColor=WHITE, leading=13, alignment=TA_CENTER)),
-        Paragraph(f"This voucher is valid for the dates specified above. "
-            f"Present this voucher at check-in.",
+            textColor=WHITE, leading=13, alignment=TA_CENTER)
+        ),
+        Paragraph(
+            footer_text,
             ParagraphStyle("av", fontSize=8, fontName="Helvetica",
-            textColor=colors.HexColor("#AABBCC"), leading=12,
-            alignment=TA_CENTER)),
+            textColor=colors.HexColor("#AABBCC"), leading=12, alignment=TA_CENTER)
+        ),
     ]], colWidths=[INNER_W])
     agent_footer.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,-1), NAVY),
@@ -1259,108 +1387,165 @@ def generate_accommodation_voucher(data):
         ("LINEABOVE", (0,0), (-1,-1), 2, GOLD),
     ]))
     story.append(agent_footer)
-
+ 
     doc.build(story)
     buffer.seek(0)
     return buffer
-
 
 # ══════════════════════════════════════════════════════════════════
 # TRANSPORT VOUCHER PDF
 # ══════════════════════════════════════════════════════════════════
 
 def generate_transport_voucher(data):
+    """
+    Generates transport voucher in one of two states:
+ 
+    RESERVED (voucher_status = "reserved"):
+      - Agent contact shown — operator contact hidden
+      - Provisional booking banner (amber)
+      - Rider: full confirmation ref provided on final payment
+ 
+    CONFIRMED (voucher_status = "confirmed"):
+      - Operator contact revealed
+      - Confirmed booking banner (green)
+      - Operator confirmation reference shown
+      - Luggage and boarding instructions
+    """
     buffer   = io.BytesIO()
     styles   = S()
-    agency   = data.get("agency_name", "SafariFlow")
+    agency   = data.get("agency_name", "SafariDesk")
     ag_email = data.get("agent_email", "")
-
+ 
+    # ── Determine voucher status ──────────────────────────────────
+    voucher_status = data.get("voucher_status", "reserved").lower()
+    is_confirmed   = voucher_status == "confirmed"
+ 
+    transport_type = data.get("transport_type", "transfer").upper()
+    icon = (
+        "&#x2708;" if data.get("transport_type") == "fly"
+        else "&#x1F6A2;" if data.get("transport_type") == "boat"
+        else "&#x1F697;"
+    )
+ 
     doc = BaseDocTemplate(
         buffer, pagesize=A4,
         leftMargin=MARGIN, rightMargin=MARGIN,
         topMargin=26*mm, bottomMargin=20*mm,
     )
-    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="main")
+    frame    = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="main")
     template = PageTemplate(
         id="main", frames=[frame],
         onPage=lambda c, d: draw_page(c, d, agency, ag_email, "TRANSPORT VOUCHER")
     )
     doc.addPageTemplates([template])
     story = []
-
-    # Header
-    transport_type = data.get("transport_type", "transfer").upper()
-    icon = "&#x2708;" if data.get("transport_type") == "fly" else \
-           "&#x1F6A2;" if data.get("transport_type") == "boat" else "&#x1F697;"
-
+ 
+    # ── Voucher Header ────────────────────────────────────────────
+    from_loc = data.get("from_location", "—")
+    to_loc   = data.get("to_location", "—")
+ 
     vchr_hdr = Table([[
-        Paragraph(f"{icon} TRANSPORT VOUCHER — {transport_type}",
-            ParagraphStyle("th", fontSize=16, fontName="Helvetica-Bold",
-            textColor=WHITE, leading=22)),
+        Table([
+            [Paragraph(
+                f"{icon} TRANSPORT VOUCHER — {transport_type}",
+                ParagraphStyle("th", fontSize=16, fontName="Helvetica-Bold",
+                textColor=WHITE, leading=22)
+            )],
+            [Paragraph(
+                f"{from_loc}  &#x27A1;  {to_loc}",
+                ParagraphStyle("tr", fontSize=10, fontName="Helvetica",
+                textColor=GOLD, leading=14)
+            )],
+        ], colWidths=[INNER_W * 0.62]),
         Table([
             [Paragraph("VOUCHER NUMBER", styles["label"])],
             [Paragraph(data.get("voucher_number", "—"), styles["value_gold"])],
-        ], colWidths=[INNER_W*0.35]),
-    ]], colWidths=[INNER_W*0.65, INNER_W*0.35])
+        ], colWidths=[INNER_W * 0.35]),
+    ]], colWidths=[INNER_W * 0.65, INNER_W * 0.35])
     vchr_hdr.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,-1), NAVY),
-        ("LEFTPADDING", (0,0), (-1,-1), 16),
-        ("RIGHTPADDING", (0,0), (-1,-1), 16),
-        ("TOPPADDING", (0,0), (-1,-1), 16),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 16),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("LINEBELOW", (0,0), (-1,-1), 2, GOLD),
-        ("LINEBEFORE", (1,0), (1,0), 1, colors.HexColor("#2A4A6A")),
-    ]))
-    story.append(vchr_hdr)
-    story.append(Spacer(1, 5*mm))
-
-    # Route highlight
-    route_banner = Table([[
-        Paragraph(data.get("from_location", "—"),
-            ParagraphStyle("rl", fontSize=14, fontName="Helvetica-Bold",
-            textColor=GOLD, leading=18, alignment=TA_CENTER)),
-        Paragraph("&#x27A1;",
-            ParagraphStyle("ra", fontSize=18, fontName="Helvetica",
-            textColor=WHITE, leading=24, alignment=TA_CENTER)),
-        Paragraph(data.get("to_location", "—"),
-            ParagraphStyle("rr", fontSize=14, fontName="Helvetica-Bold",
-            textColor=GOLD, leading=18, alignment=TA_CENTER)),
-    ]], colWidths=[INNER_W*0.42, INNER_W*0.16, INNER_W*0.42])
-    route_banner.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), NAVY_MID),
         ("LEFTPADDING", (0,0), (-1,-1), 16),
         ("RIGHTPADDING", (0,0), (-1,-1), 16),
         ("TOPPADDING", (0,0), (-1,-1), 14),
         ("BOTTOMPADDING", (0,0), (-1,-1), 14),
         ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("LINEBELOW", (0,0), (-1,-1), 1, GOLD),
+        ("LINEBELOW", (0,0), (-1,-1), 2, GOLD),
+        ("LINEBEFORE", (1,0), (1,0), 1, colors.HexColor("#2A4A6A")),
     ]))
-    story.append(route_banner)
+    story.append(vchr_hdr)
     story.append(Spacer(1, 4*mm))
-
-    # Transfer details
+ 
+    # ── Status Banner ─────────────────────────────────────────────
+    if is_confirmed:
+        status_bg     = GREEN_BG
+        status_border = GREEN
+        status_icon   = "&#x2705;"
+        status_title  = "CONFIRMED BOOKING"
+        status_text   = (
+            f"This transfer is fully confirmed. "
+            f"Operator Confirmation Reference: "
+            f"<b>{data.get('confirmation_reference', '—')}</b>"
+        )
+        status_style = styles["confirmed_text"]
+    else:
+        status_bg     = AMBER_BG
+        status_border = AMBER
+        status_icon   = "&#x26A0;"
+        status_title  = "PROVISIONAL BOOKING"
+        status_text   = (
+            "This is a provisional transfer reservation. Your full confirmation reference "
+            "and operator contact details will be provided upon receipt of final payment. "
+            "For any queries, please contact your travel specialist below."
+        )
+        status_style = styles["provisional_text"]
+ 
+    status_banner = Table([[
+        Table([
+            [Paragraph(
+                f"{status_icon}  {status_title}",
+                ParagraphStyle("sb_title", fontSize=11, fontName="Helvetica-Bold",
+                    textColor=status_border, leading=16)
+            )],
+            [Spacer(1, 3)],
+            [Paragraph(status_text, status_style)],
+        ], colWidths=[INNER_W - 28])
+    ]], colWidths=[INNER_W])
+    status_banner.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), status_bg),
+        ("LEFTPADDING", (0,0), (-1,-1), 14),
+        ("RIGHTPADDING", (0,0), (-1,-1), 14),
+        ("TOPPADDING", (0,0), (-1,-1), 12),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 12),
+        ("LINEBEFORE", (0,0), (-1,-1), 4, status_border),
+        ("LINEBELOW", (0,-1), (-1,-1), 1, status_border),
+        ("LINEABOVE", (0,0), (-1,0), 1, status_border),
+    ]))
+    story.append(status_banner)
+    story.append(Spacer(1, 5*mm))
+ 
+    # ── Transfer Details ──────────────────────────────────────────
     story.append(section_divider(styles, "TRANSFER DETAILS"))
     story.append(Spacer(1, 3*mm))
-
-    transfer_rows = [
-        ("OPERATOR",        data.get("operator_name", "—")),
-        ("VEHICLE TYPE",    data.get("vehicle_type", "—")),
-        ("PICKUP DATE",     data.get("pickup_date", "—")),
-        ("PICKUP TIME",     data.get("pickup_time", "—")),
-        ("PICKUP POINT",    data.get("pickup_point", "—")),
-        ("DROP-OFF POINT",  data.get("dropoff_point", "—")),
-        ("DURATION",        data.get("duration", "—")),
-        ("BOOKING REF",     data.get("booking_number", "—")),
+ 
+    op_col = INNER_W / 3
+    op_row1 = [
+        info_cell("OPERATOR",      data.get("operator_name", "—"), styles, op_col),
+        info_cell("VEHICLE TYPE",  data.get("vehicle_type", "—"),  styles, op_col),
+        info_cell("PICKUP DATE",   data.get("pickup_date", "—"),   styles, op_col),
     ]
-
-    tr_cells_1 = [info_cell(l, v, styles, INNER_W/4)
-                  for l, v in transfer_rows[:4]]
-    tr_cells_2 = [info_cell(l, v, styles, INNER_W/4)
-                  for l, v in transfer_rows[4:]]
-
-    for cells in [tr_cells_1, tr_cells_2]:
-        t = Table([cells], colWidths=[INNER_W/4]*4)
+    op_row2 = [
+        info_cell("PICKUP TIME",   data.get("pickup_time", "—"),   styles, op_col),
+        info_cell("PICKUP POINT",  data.get("pickup_point", "—"),  styles, op_col),
+        info_cell("DROP-OFF POINT",data.get("dropoff_point", "—"), styles, op_col),
+    ]
+    op_row3 = [
+        info_cell("DURATION",      data.get("duration", "—"),      styles, op_col),
+        info_cell("BOOKING REF",   data.get("booking_number", "—"),styles, op_col),
+        info_cell("PASSENGERS",    str(data.get("pax", "—")),      styles, op_col),
+    ]
+ 
+    for row in [op_row1, op_row2, op_row3]:
+        t = Table([row], colWidths=[op_col]*3)
         t.setStyle(TableStyle([
             ("BACKGROUND", (0,0), (-1,-1), CREAM),
             ("LEFTPADDING", (0,0), (-1,-1), 10),
@@ -1368,23 +1553,22 @@ def generate_transport_voucher(data):
             ("BOTTOMPADDING", (0,0), (-1,-1), 8),
             ("LINEBEFORE", (1,0),(1,-1), 0.5, BORDER),
             ("LINEBEFORE", (2,0),(2,-1), 0.5, BORDER),
-            ("LINEBEFORE", (3,0),(3,-1), 0.5, BORDER),
             ("LINEBELOW", (0,-1),(-1,-1), 0.5, BORDER),
         ]))
         story.append(t)
     story.append(Spacer(1, 4*mm))
-
-    # Passengers
-    passengers = data.get("passenger_names", [])
-    if passengers:
+ 
+    # ── Passengers ────────────────────────────────────────────────
+    guests = data.get("guest_names", [])
+    if guests:
         story.append(section_divider(styles, "PASSENGERS"))
         story.append(Spacer(1, 3*mm))
-        pax_rows = [[
+        guest_rows = [[
             Paragraph(str(i+1), styles["label"]),
-            Paragraph(p, styles["body"]),
-        ] for i, p in enumerate(passengers)]
-        pax_table = Table(pax_rows, colWidths=[INNER_W*0.1, INNER_W*0.9])
-        pax_table.setStyle(TableStyle([
+            Paragraph(g, styles["body"]),
+        ] for i, g in enumerate(guests)]
+        guest_table = Table(guest_rows, colWidths=[INNER_W*0.1, INNER_W*0.9])
+        guest_table.setStyle(TableStyle([
             ("BACKGROUND", (0,0), (-1,-1), WHITE),
             ("LEFTPADDING", (0,0), (-1,-1), 12),
             ("TOPPADDING", (0,0), (-1,-1), 6),
@@ -1392,19 +1576,37 @@ def generate_transport_voucher(data):
             ("LINEBELOW", (0,0), (-1,-1), 0.3, BORDER),
             ("LINEABOVE", (0,0), (-1,0), 0.5, BORDER),
         ]))
-        story.append(pax_table)
+        story.append(guest_table)
         story.append(Spacer(1, 4*mm))
-
-    # Operator contact
-    story.append(section_divider(styles, "OPERATOR CONTACT"))
-    story.append(Spacer(1, 3*mm))
-
-    op_col = INNER_W / 3
-    op_cells = [
-        info_cell("OPERATOR EMAIL", data.get("operator_email", "—"), styles, op_col),
-        info_cell("OPERATOR PHONE", data.get("operator_phone", "—"), styles, op_col),
-        info_cell("CONFIRMATION REF", data.get("operator_ref", "—"), styles, op_col),
-    ]
+ 
+    # ── Operator Contact ──────────────────────────────────────────
+    # RESERVED → show agent contact
+    # CONFIRMED → show operator contact
+    if is_confirmed:
+        story.append(section_divider(styles, "OPERATOR CONTACT"))
+        story.append(Spacer(1, 3*mm))
+        op_cells = [
+            info_cell("OPERATOR EMAIL",   data.get("operator_email", "—"), styles, op_col),
+            info_cell("OPERATOR PHONE",   data.get("operator_phone", "—"), styles, op_col),
+            info_cell("CONFIRMATION REF", data.get("confirmation_reference", "—"), styles, op_col),
+        ]
+        contact_note = (
+            "Present this voucher to your driver or pilot at the time of transfer. "
+            "Quote your confirmation reference when checking in."
+        )
+    else:
+        story.append(section_divider(styles, "YOUR TRAVEL SPECIALIST"))
+        story.append(Spacer(1, 3*mm))
+        op_cells = [
+            info_cell("CONTACT NAME",  data.get("agency_name", "—"),  styles, op_col),
+            info_cell("CONTACT EMAIL", data.get("agent_email", "—"),  styles, op_col),
+            info_cell("CONTACT PHONE", data.get("agent_phone", "—"),  styles, op_col),
+        ]
+        contact_note = (
+            "For all pre-transfer queries, please contact your travel specialist above. "
+            "Operator contact details and confirmation reference will be provided upon full payment."
+        )
+ 
     op_table = Table([op_cells], colWidths=[op_col]*3)
     op_table.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,-1), CREAM),
@@ -1416,12 +1618,28 @@ def generate_transport_voucher(data):
         ("LINEBELOW", (0,-1),(-1,-1), 1, GOLD),
     ]))
     story.append(op_table)
-    story.append(Spacer(1, 4*mm))
-
-    # Notes
-    notes = data.get("special_notes", "")
-    if notes:
-        notes_t = Table([[Paragraph(notes, styles["note"])]], colWidths=[INNER_W])
+    story.append(Spacer(1, 3*mm))
+ 
+    # Contact instruction note
+    contact_note_table = Table(
+        [[Paragraph(contact_note, styles["note"])]],
+        colWidths=[INNER_W]
+    )
+    contact_note_table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), GOLD_BG),
+        ("LEFTPADDING", (0,0), (-1,-1), 14),
+        ("RIGHTPADDING", (0,0), (-1,-1), 14),
+        ("TOPPADDING", (0,0), (-1,-1), 8),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+        ("LINEBEFORE", (0,0), (-1,-1), 3, GOLD),
+    ]))
+    story.append(contact_note_table)
+ 
+    # ── Special Notes ─────────────────────────────────────────────
+    special_notes = data.get("special_notes", "")
+    if special_notes:
+        story.append(Spacer(1, 4*mm))
+        notes_t = Table([[Paragraph(special_notes, styles["note"])]], colWidths=[INNER_W])
         notes_t.setStyle(TableStyle([
             ("BACKGROUND", (0,0), (-1,-1), GOLD_BG),
             ("LEFTPADDING", (0,0), (-1,-1), 14),
@@ -1431,17 +1649,26 @@ def generate_transport_voucher(data):
             ("LINEBEFORE", (0,0), (-1,-1), 3, GOLD),
         ]))
         story.append(notes_t)
-        story.append(Spacer(1, 4*mm))
-
-    # Footer
+ 
+    story.append(Spacer(1, 4*mm))
+ 
+    # ── Footer ────────────────────────────────────────────────────
+    footer_text = (
+        "Present this voucher to your driver/pilot at the time of transfer."
+        if is_confirmed else
+        "This is a provisional voucher. Operator details will follow upon full payment."
+    )
     agent_footer = Table([[
-        Paragraph(f"Issued by: {agency}  ·  {ag_email}",
+        Paragraph(
+            f"Issued by: {agency}  ·  {ag_email}",
             ParagraphStyle("af2", fontSize=9, fontName="Helvetica-Bold",
-            textColor=WHITE, leading=13, alignment=TA_CENTER)),
-        Paragraph("Present this voucher to your driver/pilot at the time of transfer.",
+            textColor=WHITE, leading=13, alignment=TA_CENTER)
+        ),
+        Paragraph(
+            footer_text,
             ParagraphStyle("av2", fontSize=8, fontName="Helvetica",
-            textColor=colors.HexColor("#AABBCC"), leading=12,
-            alignment=TA_CENTER)),
+            textColor=colors.HexColor("#AABBCC"), leading=12, alignment=TA_CENTER)
+        ),
     ]], colWidths=[INNER_W])
     agent_footer.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,-1), NAVY),
@@ -1452,130 +1679,7 @@ def generate_transport_voucher(data):
         ("LINEABOVE", (0,0), (-1,-1), 2, GOLD),
     ]))
     story.append(agent_footer)
-
-    doc.build(story)
-    buffer.seek(0)
-    return buffer
-
-
-# ─── Keep original itinerary PDF for backwards compatibility ──────
-def generate_itinerary_pdf(data):
-    """Original itinerary PDF — maintained for backwards compatibility"""
-    buffer   = io.BytesIO()
-    styles   = S()
-    agency   = data.get("agency_name", "SafariFlow")
-    ag_email = data.get("agent_email", "")
-
-    doc = BaseDocTemplate(
-        buffer, pagesize=A4,
-        leftMargin=MARGIN, rightMargin=MARGIN,
-        topMargin=26*mm, bottomMargin=20*mm,
-    )
-    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="main")
-    template = PageTemplate(
-        id="main", frames=[frame],
-        onPage=lambda c, d: draw_page(c, d, agency, ag_email, "TRAVEL ITINERARY")
-    )
-    doc.addPageTemplates([template])
-    story = []
-
-    hero_data = [[
-        Paragraph(data.get("destination","Your Journey"), styles["hero_name"]),
-        Table([
-            [Paragraph("ITINERARY REF", styles["label"])],
-            [Paragraph(data.get("itinerary_number","—"), styles["value_gold"])],
-            [Spacer(1, 4)],
-            [Paragraph("TRAVEL DATES", styles["label"])],
-            [Paragraph(data.get("travel_dates","—"), styles["value"])],
-        ], colWidths=[INNER_W*0.35])
-    ]]
-    hero = Table(hero_data, colWidths=[INNER_W*0.65, INNER_W*0.35])
-    hero.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), CREAM),
-        ("LEFTPADDING", (0,0), (-1,-1), 16),
-        ("RIGHTPADDING", (0,0), (-1,-1), 16),
-        ("TOPPADDING", (0,0), (-1,-1), 14),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 14),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("LINEBELOW", (0,0), (-1,-1), 2, GOLD),
-        ("LINEBEFORE", (1,0), (1,-1), 1, BORDER),
-    ]))
-    story.append(hero)
-    story.append(Spacer(1, 6*mm))
-
-    summary = [
-        ("CLIENT", data.get("client_name","—")),
-        ("TRAVELERS", str(data.get("num_travelers","—"))),
-        ("DAYS", str(len(data.get("days",[])))),
-        ("AGENT", data.get("agent_name","—")),
-    ]
-    col_w = INNER_W / 4
-    sum_cells = [info_cell(l, v, styles, col_w) for l, v in summary]
-    sum_table = Table([sum_cells], colWidths=[col_w]*4)
-    sum_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), WHITE),
-        ("LEFTPADDING", (0,0), (-1,-1), 10),
-        ("TOPPADDING", (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-        ("LINEBELOW", (0,-1), (-1,-1), 1, GOLD),
-        ("LINEBEFORE", (1,0),(1,-1), 0.5, BORDER),
-        ("LINEBEFORE", (2,0),(2,-1), 0.5, BORDER),
-        ("LINEBEFORE", (3,0),(3,-1), 0.5, BORDER),
-    ]))
-    story.append(sum_table)
-    story.append(Spacer(1, 6*mm))
-    story.append(Paragraph("YOUR DAY-BY-DAY ITINERARY", styles["section_title"]))
-    story.append(Spacer(1, 3*mm))
-
-    for day in data.get("days", []):
-        day_num   = day.get("day_number","")
-        day_date  = day.get("date","")
-        day_title = day.get("title","")
-
-        day_hdr = Table([[
-            Paragraph(f"DAY {day_num}", ParagraphStyle("dn", fontSize=8,
-                fontName="Helvetica-Bold", textColor=GOLD, leading=12)),
-            Paragraph(f"<b>{day_title}</b>", ParagraphStyle("dt", fontSize=11,
-                fontName="Helvetica-Bold", textColor=WHITE, leading=15)),
-            Paragraph(day_date, ParagraphStyle("dd", fontSize=8.5,
-                fontName="Helvetica", textColor=colors.HexColor("#9AABBF"),
-                leading=12, alignment=TA_RIGHT)),
-        ]], colWidths=[INNER_W*0.1, INNER_W*0.63, INNER_W*0.27])
-        day_hdr.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), NAVY),
-            ("LEFTPADDING", (0,0), (-1,-1), 12),
-            ("RIGHTPADDING", (0,0), (-1,-1), 12),
-            ("TOPPADDING", (0,0), (-1,-1), 8),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-            ("LINEBELOW", (0,0), (-1,-1), 1.5, GOLD),
-        ]))
-
-        act_rows = []
-        for i, act in enumerate(day.get("activities", [])):
-            bg = WHITE if i % 2 == 0 else LIGHT_GREY
-            act_row = Table([[
-                Paragraph(act.get("time",""), ParagraphStyle("at", fontSize=8,
-                    fontName="Helvetica-Bold", textColor=GOLD, leading=11)),
-                Table([
-                    [Paragraph(act.get("title",""), ParagraphStyle("atl", fontSize=10,
-                        fontName="Helvetica-Bold", textColor=NAVY, leading=13))],
-                    [Paragraph(act.get("description",""), styles["body_mid"])],
-                ], colWidths=[INNER_W*0.88 - 8]),
-            ]], colWidths=[INNER_W*0.12, INNER_W*0.88])
-            act_row.setStyle(TableStyle([
-                ("BACKGROUND", (0,0), (-1,-1), bg),
-                ("LEFTPADDING", (0,0), (-1,-1), 10),
-                ("RIGHTPADDING", (0,0), (-1,-1), 10),
-                ("TOPPADDING", (0,0), (-1,-1), 7),
-                ("BOTTOMPADDING", (0,0), (-1,-1), 7),
-                ("VALIGN", (0,0), (-1,-1), "TOP"),
-                ("LINEBELOW", (0,0), (-1,-1), 0.3, BORDER),
-            ]))
-            act_rows.append(act_row)
-
-        story.append(KeepTogether([day_hdr] + act_rows + [Spacer(1, 4*mm)]))
-
+ 
     doc.build(story)
     buffer.seek(0)
     return buffer
