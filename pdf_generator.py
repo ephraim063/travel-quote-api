@@ -1,1685 +1,896 @@
-import io
-import requests
-from datetime import datetime
+"""
+SafariFlow PDF Generator v3
+Produces a luxury safari quote document from the Make.com payload.
+
+PDF Structure:
+  Page 1   — Header band · client info · quote meta · overview narrative
+  Page 2+  — Day-by-day itinerary with destination placeholder bars
+  Page N   — Investment breakdown · pricing totals
+  Page N   — Inclusions/exclusions · terms · respond section
+  Last     — Agent trust page · stats · awards · reviews · contact
+
+Data sources:
+  agent / agent_profile / agent_reviews → Supabase-Fetch Agent (Module 42)
+  client / trip                         → Variables-Normalize Data (Module 49)
+  itinerary / line_items / pricing      → Claude 2-Build Itinerary (Module 51)
+  narrative                             → Claude 3-Write Narrative (Module 52)
+
+Note: Destination photos (Unsplash) are a later phase.
+      Placeholder bars show destination name until photos are integrated.
+"""
+
 from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
 from reportlab.lib.units import mm
+from reportlab.lib.colors import HexColor, white
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 from reportlab.platypus import (
-    BaseDocTemplate, PageTemplate, Frame,
-    Paragraph, Spacer, Table, TableStyle,
-    HRFlowable, KeepTogether, Image, PageBreak
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+    HRFlowable, KeepTogether, PageBreak
 )
-from reportlab.lib.utils import ImageReader
+from reportlab.platypus.flowables import Flowable
 
-# ─────────────────────────────────────────────────────────────────
-# SafariFlow PDF Generator v2.0
-# Generates: Quote PDF, Receipt PDF, Accommodation Voucher, Transport Voucher
-# Maintains original Navy + Gold branding
-# ─────────────────────────────────────────────────────────────────
 
-# ─── Brand Colors (unchanged) ────────────────────────────────────
-NAVY        = colors.HexColor("#0D1E35")
-NAVY_MID    = colors.HexColor("#1A2E4A")
-GOLD        = colors.HexColor("#C8A96E")
-GOLD_LIGHT  = colors.HexColor("#E8C98E")
-GOLD_BG     = colors.HexColor("#FBF6EE")
-SAGE        = colors.HexColor("#4A7C59")
-CREAM       = colors.HexColor("#FAFAF8")
-LIGHT_GREY  = colors.HexColor("#F4F4F2")
-BORDER      = colors.HexColor("#E0DDD8")
-WHITE       = colors.white
-TEXT_DARK   = colors.HexColor("#1A1A1A")
-TEXT_MID    = colors.HexColor("#555550")
-TEXT_LIGHT  = colors.HexColor("#999990")
-GREEN       = colors.HexColor("#27AE60")
-RED         = colors.HexColor("#E74C3C")
+# ─── Colours ──────────────────────────────────────────────────────────────────
+NAVY       = HexColor('#1B2A47')
+GOLD       = HexColor('#C4922A')
+GOLD_STAR  = HexColor('#E8C068')
+EARTH      = HexColor('#2C1810')
+SAGE       = HexColor('#4A5E3A')
+SAND       = HexColor('#F5F0E8')
+CHARCOAL   = HexColor('#3D3D3D')
+MUTED      = HexColor('#7A7A7A')
+RULE_CLR   = HexColor('#D4B896')
+TABLE_ALT  = HexColor('#FAF7F2')
+NAVY_MUTED = HexColor('#8A9AB8')
+REVIEW_BG  = HexColor('#F9F6F0')
 
+
+# ─── Page geometry ────────────────────────────────────────────────────────────
 PAGE_W, PAGE_H = A4
-MARGIN  = 16 * mm
-INNER_W = PAGE_W - 2 * MARGIN
+ML = 18 * mm
+MR = 18 * mm
+MT = 14 * mm
+MB = 22 * mm
+CW = PAGE_W - ML - MR
 
 
-# ─── Styles (unchanged + new additions) ──────────────────────────
-def S():
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+def safe(val, fallback='—'):
+    if val is None or str(val).strip().lower() in ('', 'null', 'none'):
+        return fallback
+    return str(val).strip()
+
+
+def usd(val):
+    try:
+        return f"${float(val):,.0f}"
+    except (TypeError, ValueError):
+        return safe(val)
+
+
+def hr(width=None, color=RULE_CLR, thickness=0.4, sb=3, sa=4):
+    return HRFlowable(
+        width=width or CW, thickness=thickness,
+        color=color, spaceBefore=sb, spaceAfter=sa
+    )
+
+
+class DestinationBar(Flowable):
+    """
+    Sand-coloured placeholder bar shown where a destination photo will appear.
+    Displays the destination name centred. Photo integration added in a later phase.
+    """
+    def __init__(self, destination):
+        super().__init__()
+        self.width       = CW
+        self.height      = 14 * mm
+        self.destination = destination
+
+    def draw(self):
+        c = self.canv
+        c.setFillColor(SAND)
+        c.roundRect(0, 0, self.width, self.height, 3, fill=1, stroke=0)
+        c.setFillColor(RULE_CLR)
+        c.setFont('Helvetica', 8)
+        c.drawCentredString(self.width / 2, self.height / 2 - 3,
+                            self.destination.upper())
+
+
+# ─── Typography ───────────────────────────────────────────────────────────────
+def make_styles():
     return {
-        "agency": ParagraphStyle("agency", fontSize=15, fontName="Helvetica-Bold",
-            textColor=WHITE, leading=20),
-        "agency_sub": ParagraphStyle("agency_sub", fontSize=8, fontName="Helvetica",
-            textColor=colors.HexColor("#AABBCC"), leading=12, letterSpacing=1.5),
-        "doc_type": ParagraphStyle("doc_type", fontSize=9, fontName="Helvetica-Bold",
-            textColor=GOLD, leading=13, letterSpacing=2),
-        "hero_name": ParagraphStyle("hero_name", fontSize=20, fontName="Helvetica-Bold",
-            textColor=NAVY, leading=26),
-        "hero_dest": ParagraphStyle("hero_dest", fontSize=11, fontName="Helvetica",
-            textColor=TEXT_MID, leading=16),
-        "label": ParagraphStyle("label", fontSize=7, fontName="Helvetica-Bold",
-            textColor=TEXT_LIGHT, leading=11, letterSpacing=1.2),
-        "value": ParagraphStyle("value", fontSize=10, fontName="Helvetica-Bold",
-            textColor=TEXT_DARK, leading=14),
-        "value_gold": ParagraphStyle("value_gold", fontSize=10, fontName="Helvetica-Bold",
-            textColor=GOLD, leading=14),
-        "body": ParagraphStyle("body", fontSize=9.5, fontName="Helvetica",
-            textColor=TEXT_DARK, leading=14),
-        "body_mid": ParagraphStyle("body_mid", fontSize=9, fontName="Helvetica",
-            textColor=TEXT_MID, leading=13),
-        "body_small": ParagraphStyle("body_small", fontSize=8, fontName="Helvetica",
-            textColor=TEXT_LIGHT, leading=12),
-        "section_title": ParagraphStyle("section_title", fontSize=8, fontName="Helvetica-Bold",
-            textColor=NAVY, leading=12, letterSpacing=1.5),
-        "item_desc": ParagraphStyle("item_desc", fontSize=9.5, fontName="Helvetica-Bold",
-            textColor=TEXT_DARK, leading=13),
-        "item_detail": ParagraphStyle("item_detail", fontSize=8.5, fontName="Helvetica",
-            textColor=TEXT_MID, leading=12),
-        "price": ParagraphStyle("price", fontSize=9.5, fontName="Helvetica",
-            textColor=TEXT_DARK, leading=13, alignment=TA_RIGHT),
-        "price_bold": ParagraphStyle("price_bold", fontSize=9.5, fontName="Helvetica-Bold",
-            textColor=TEXT_DARK, leading=13, alignment=TA_RIGHT),
-        "total_label": ParagraphStyle("total_label", fontSize=10, fontName="Helvetica-Bold",
-            textColor=GOLD_LIGHT, leading=14),
-        "total_amount": ParagraphStyle("total_amount", fontSize=20, fontName="Helvetica-Bold",
-            textColor=WHITE, leading=24, alignment=TA_RIGHT),
-        "footer": ParagraphStyle("footer", fontSize=7.5, fontName="Helvetica",
-            textColor=TEXT_LIGHT, leading=11, alignment=TA_CENTER),
-        "agent_name": ParagraphStyle("agent_name", fontSize=11, fontName="Helvetica-Bold",
-            textColor=NAVY, leading=16),
-        "note": ParagraphStyle("note", fontSize=8.5, fontName="Helvetica",
-            textColor=TEXT_MID, leading=13),
-        "inc_title": ParagraphStyle("inc_title", fontSize=8, fontName="Helvetica-Bold",
-            textColor=SAGE, leading=12, letterSpacing=1),
-        "exc_title": ParagraphStyle("exc_title", fontSize=8, fontName="Helvetica-Bold",
-            textColor=colors.HexColor("#C0392B"), leading=12, letterSpacing=1),
-        "inc_item": ParagraphStyle("inc_item", fontSize=9, fontName="Helvetica",
-            textColor=TEXT_DARK, leading=13),
-        "right_label": ParagraphStyle("right_label", fontSize=8, fontName="Helvetica",
-            textColor=TEXT_MID, leading=12, alignment=TA_RIGHT),
-        # New styles for v2
-        "narrative": ParagraphStyle("narrative", fontSize=10, fontName="Helvetica",
-            textColor=TEXT_DARK, leading=16),
-        "narrative_intro": ParagraphStyle("narrative_intro", fontSize=11, fontName="Helvetica",
-            textColor=TEXT_MID, leading=17, leftIndent=8,
-            borderPadding=(8, 0, 8, 0)),
-        "day_title": ParagraphStyle("day_title", fontSize=13, fontName="Helvetica-Bold",
-            textColor=WHITE, leading=18),
-        "day_narrative": ParagraphStyle("day_narrative", fontSize=9.5, fontName="Helvetica",
-            textColor=TEXT_DARK, leading=15),
-        "highlight": ParagraphStyle("highlight", fontSize=9, fontName="Helvetica-Bold",
-            textColor=SAGE, leading=13),
-        "review_text": ParagraphStyle("review_text", fontSize=9.5, fontName="Helvetica",
-            textColor=TEXT_DARK, leading=15),
-        "reviewer": ParagraphStyle("reviewer", fontSize=8, fontName="Helvetica-Bold",
-            textColor=GOLD, leading=12),
-        "award_item": ParagraphStyle("award_item", fontSize=9, fontName="Helvetica",
-            textColor=TEXT_DARK, leading=13),
-        "bio": ParagraphStyle("bio", fontSize=9.5, fontName="Helvetica",
-            textColor=TEXT_MID, leading=15),
-        "social": ParagraphStyle("social", fontSize=9, fontName="Helvetica",
-            textColor=GOLD, leading=13),
-        "voucher_title": ParagraphStyle("voucher_title", fontSize=18, fontName="Helvetica-Bold",
-            textColor=WHITE, leading=24),
-        "voucher_ref": ParagraphStyle("voucher_ref", fontSize=10, fontName="Helvetica-Bold",
-            textColor=GOLD, leading=14),
-        "receipt_amount": ParagraphStyle("receipt_amount", fontSize=24, fontName="Helvetica-Bold",
-            textColor=WHITE, leading=30, alignment=TA_RIGHT),
-        "center": ParagraphStyle("center", fontSize=9, fontName="Helvetica",
-            textColor=TEXT_MID, leading=13, alignment=TA_CENTER),
+        'section': ParagraphStyle('section',
+            fontName='Helvetica-Bold', fontSize=8,
+            textColor=SAGE, leading=10,
+            spaceBefore=8, spaceAfter=2),
+        'h1': ParagraphStyle('h1',
+            fontName='Helvetica-Bold', fontSize=16,
+            textColor=EARTH, leading=20, spaceBefore=4, spaceAfter=4),
+        'h2': ParagraphStyle('h2',
+            fontName='Helvetica-Bold', fontSize=11,
+            textColor=EARTH, leading=14),
+        'body': ParagraphStyle('body',
+            fontName='Helvetica', fontSize=10,
+            textColor=CHARCOAL, leading=15),
+        'body_sm': ParagraphStyle('body_sm',
+            fontName='Helvetica', fontSize=9,
+            textColor=CHARCOAL, leading=13),
+        'italic': ParagraphStyle('italic',
+            fontName='Helvetica-Oblique', fontSize=10.5,
+            textColor=CHARCOAL, leading=16),
+        'muted': ParagraphStyle('muted',
+            fontName='Helvetica', fontSize=8,
+            textColor=MUTED, leading=11),
+        'footer': ParagraphStyle('footer',
+            fontName='Helvetica', fontSize=7.5,
+            textColor=MUTED, leading=10, alignment=TA_CENTER),
+        'meta_lbl': ParagraphStyle('meta_lbl',
+            fontName='Helvetica-Bold', fontSize=7.5,
+            textColor=MUTED, leading=9),
+        'meta_val': ParagraphStyle('meta_val',
+            fontName='Helvetica', fontSize=9,
+            textColor=CHARCOAL, leading=12),
+        'meta_bold': ParagraphStyle('meta_bold',
+            fontName='Helvetica-Bold', fontSize=9,
+            textColor=CHARCOAL, leading=12),
+        'client_name': ParagraphStyle('client_name',
+            fontName='Helvetica-Bold', fontSize=17,
+            textColor=EARTH, leading=21),
+        'client_tag': ParagraphStyle('client_tag',
+            fontName='Helvetica', fontSize=9,
+            textColor=MUTED, leading=12),
+        'day_num': ParagraphStyle('day_num',
+            fontName='Helvetica-Bold', fontSize=8.5,
+            textColor=GOLD, leading=11),
+        'day_dest': ParagraphStyle('day_dest',
+            fontName='Helvetica', fontSize=8.5,
+            textColor=MUTED, leading=11, alignment=TA_RIGHT),
+        'day_title': ParagraphStyle('day_title',
+            fontName='Helvetica-Bold', fontSize=12,
+            textColor=EARTH, leading=15),
+        'highlight': ParagraphStyle('highlight',
+            fontName='Helvetica-Oblique', fontSize=9,
+            textColor=SAGE, leading=12),
+        'th': ParagraphStyle('th',
+            fontName='Helvetica-Bold', fontSize=8.5,
+            textColor=white, leading=11),
+        'td': ParagraphStyle('td',
+            fontName='Helvetica', fontSize=8.5,
+            textColor=CHARCOAL, leading=12),
+        'td_r': ParagraphStyle('td_r',
+            fontName='Helvetica', fontSize=8.5,
+            textColor=CHARCOAL, leading=12, alignment=TA_RIGHT),
+        'total_lbl': ParagraphStyle('total_lbl',
+            fontName='Helvetica', fontSize=9,
+            textColor=MUTED, leading=12, alignment=TA_RIGHT),
+        'total_val': ParagraphStyle('total_val',
+            fontName='Helvetica-Bold', fontSize=14,
+            textColor=EARTH, leading=18, alignment=TA_RIGHT),
+        'agent_name': ParagraphStyle('agent_name',
+            fontName='Helvetica-Bold', fontSize=18,
+            textColor=EARTH, leading=22),
+        'agent_tag': ParagraphStyle('agent_tag',
+            fontName='Helvetica', fontSize=9,
+            textColor=MUTED, leading=12),
+        'agent_bio': ParagraphStyle('agent_bio',
+            fontName='Helvetica', fontSize=9.5,
+            textColor=CHARCOAL, leading=14),
+        'stat_num': ParagraphStyle('stat_num',
+            fontName='Helvetica-Bold', fontSize=20,
+            textColor=GOLD, leading=24, alignment=TA_CENTER),
+        'stat_lbl': ParagraphStyle('stat_lbl',
+            fontName='Helvetica', fontSize=8,
+            textColor=MUTED, leading=10, alignment=TA_CENTER),
+        'award': ParagraphStyle('award',
+            fontName='Helvetica', fontSize=9,
+            textColor=CHARCOAL, leading=13),
+        'review_body': ParagraphStyle('review_body',
+            fontName='Helvetica-Oblique', fontSize=8.5,
+            textColor=CHARCOAL, leading=13),
+        'review_author': ParagraphStyle('review_author',
+            fontName='Helvetica-Bold', fontSize=8,
+            textColor=EARTH, leading=11),
+        'review_origin': ParagraphStyle('review_origin',
+            fontName='Helvetica', fontSize=7.5,
+            textColor=MUTED, leading=10),
+        'contact': ParagraphStyle('contact',
+            fontName='Helvetica', fontSize=9,
+            textColor=CHARCOAL, leading=13),
     }
 
 
-def fmt_currency(amount, symbol="$"):
-    try:
-        return f"{symbol}{float(amount):,.2f}"
-    except (ValueError, TypeError):
-        return f"{symbol}0.00"
+# ─── Header band flowable ─────────────────────────────────────────────────────
+class HeaderBand(Flowable):
+    """Full-width navy band: agency name + tagline left · SAFARI QUOTE right."""
+    def __init__(self, agency, tagline='TRAVEL & SAFARI SPECIALISTS'):
+        super().__init__()
+        self.width   = CW
+        self.height  = 20 * mm
+        self.agency  = agency.upper()
+        self.tagline = tagline.upper()
+
+    def draw(self):
+        c   = self.canv
+        w, h = self.width, self.height
+        pad  = 5 * mm
+
+        c.setFillColor(NAVY)
+        c.rect(0, 0, w, h, fill=1, stroke=0)
+
+        # Gold bottom rule
+        c.setFillColor(GOLD)
+        c.rect(0, 0, w, 2, fill=1, stroke=0)
+
+        # Agency name
+        c.setFillColor(white)
+        c.setFont('Helvetica-Bold', 17)
+        c.drawString(pad, h * 0.50, self.agency)
+
+        # Tagline
+        c.setFillColor(NAVY_MUTED)
+        c.setFont('Helvetica', 8)
+        c.drawString(pad, h * 0.24, self.tagline)
+
+        # SAFARI QUOTE
+        c.setFillColor(GOLD)
+        c.setFont('Helvetica-Bold', 9.5)
+        c.drawRightString(w - pad, h * 0.50, 'SAFARI QUOTE')
+
+        # Page label
+        c.setFillColor(NAVY_MUTED)
+        c.setFont('Helvetica', 8)
+        c.drawRightString(w - pad, h * 0.24, 'Page 1')
 
 
-def fmt_cents(cents, symbol="$"):
-    try:
-        return fmt_currency(float(cents) / 100, symbol)
-    except:
-        return f"{symbol}0.00"
+# ─── Section 1: Page 1 header ─────────────────────────────────────────────────
+def build_page1(data, S, story):
+    agent   = data.get('agent', {})
+    client  = data.get('client', {})
+    trip    = data.get('trip', {})
+    profile = data.get('agent_profile', {})
 
+    agency     = safe(agent.get('agency'), 'Safari Agency')
+    agent_name = safe(agent.get('name'))
+    agent_email= safe(agent.get('email'))
+    tagline    = safe(profile.get('tagline'), 'Travel & Safari Specialists')
+    quote_id   = safe(data.get('quote_id'), 'SF-0001')
+    gen_date   = safe(data.get('generated_at'))
 
-def stars(rating):
-    try:
-        r = int(float(rating))
-        return "★" * r + "☆" * (5 - r)
-    except:
-        return "★★★★★"
+    client_name = safe(client.get('name'))
+    nationality = safe(client.get('nationality'), '')
+    pax_adults  = safe(client.get('pax_adults'), '2')
+    pax_kids    = safe(client.get('pax_children'), '0')
+    pax_str     = f"{pax_adults} Adults"
+    if pax_kids not in ('0', '—'):
+        pax_str += f", {pax_kids} Children"
 
+    start  = safe(trip.get('start_date'))
+    end    = safe(trip.get('end_date'))
+    nights = safe(trip.get('duration_nights'))
+    dests  = safe(trip.get('destinations'))
 
-# ─── Fetch image from URL ─────────────────────────────────────────
-def fetch_image(url, width, height):
-    """Fetch image from URL and return ReportLab Image object"""
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            img_buffer = io.BytesIO(response.content)
-            return Image(img_buffer, width=width, height=height)
-    except Exception as e:
-        print(f"[WARN] Could not fetch image: {url} — {e}")
-    return None
+    # ── Navy header band ──────────────────────────────────────────────────────
+    story.append(HeaderBand(agency, tagline))
+    story.append(Spacer(1, 3 * mm))
 
+    # Subline
+    story.append(Paragraph(
+        f"{agency}  ·  {agent_email}  ·  Prepared {gen_date}",
+        S['muted']
+    ))
+    story.append(Spacer(1, 4 * mm))
 
-def fetch_unsplash_image(query, width, height, access_key=None):
-    """Fetch a relevant image from Unsplash API"""
-    if not access_key:
-        return None
-    try:
-        url = f"https://api.unsplash.com/search/photos?query={query}&orientation=landscape&per_page=1"
-        headers = {"Authorization": f"Client-ID {access_key}"}
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("results"):
-                img_url = data["results"][0]["urls"]["regular"]
-                return fetch_image(img_url, width, height)
-    except Exception as e:
-        print(f"[WARN] Unsplash fetch failed: {e}")
-    return None
+    # ── Client hero block ─────────────────────────────────────────────────────
+    dest_line = '  ·  '.join(
+        [f"✈ {d.strip()}" for d in dests.split(',')]
+    ) if dests != '—' else ''
 
-
-# ─── Page Canvas (header + footer) — unchanged ───────────────────
-def draw_page(canvas, doc, agency_name, agent_email, doc_label):
-    canvas.saveState()
-    w, h = A4
-
-    canvas.setFillColor(NAVY)
-    canvas.rect(0, h - 20*mm, w, 20*mm, fill=1, stroke=0)
-
-    canvas.setFillColor(GOLD)
-    canvas.rect(0, h - 21.5*mm, w, 1.5*mm, fill=1, stroke=0)
-
-    canvas.setFont("Helvetica-Bold", 13)
-    canvas.setFillColor(WHITE)
-    canvas.drawString(MARGIN, h - 11*mm, agency_name.upper())
-    canvas.setFont("Helvetica", 7.5)
-    canvas.setFillColor(colors.HexColor("#7899BB"))
-    canvas.drawString(MARGIN, h - 16*mm, "TRAVEL & SAFARI SPECIALISTS")
-
-    canvas.setFont("Helvetica-Bold", 9)
-    canvas.setFillColor(GOLD)
-    canvas.drawRightString(w - MARGIN, h - 11*mm, doc_label)
-    canvas.setFont("Helvetica", 7.5)
-    canvas.setFillColor(colors.HexColor("#7899BB"))
-    canvas.drawRightString(w - MARGIN, h - 16*mm, f"Page {doc.page}")
-
-    canvas.setFillColor(LIGHT_GREY)
-    canvas.rect(0, 0, w, 14*mm, fill=1, stroke=0)
-
-    canvas.setStrokeColor(GOLD)
-    canvas.setLineWidth(0.8)
-    canvas.line(0, 14*mm, w, 14*mm)
-
-    canvas.setFont("Helvetica", 7.5)
-    canvas.setFillColor(TEXT_LIGHT)
-    footer = f"{agency_name}  ·  {agent_email}  ·  Prepared {datetime.now().strftime('%d %B %Y')}"
-    canvas.drawCentredString(w/2, 5.5*mm, footer)
-
-    canvas.restoreState()
-
-
-# ─── HELPER: Section divider ─────────────────────────────────────
-def section_divider(styles, title):
-    t = Table([[Paragraph(title, styles["section_title"])]],
-        colWidths=[INNER_W])
-    t.setStyle(TableStyle([
-        ("LINEBELOW", (0,0), (-1,-1), 1.5, GOLD),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
-        ("TOPPADDING", (0,0), (-1,-1), 2),
+    left_rows = [
+        [Paragraph('Safari Proposal prepared for', S['muted'])],
+        [Paragraph(client_name, S['client_name'])],
+        [Spacer(1, 2)],
+        [Paragraph(dest_line, S['client_tag'])],
+    ]
+    left_t = Table(left_rows, colWidths=[CW * 0.52])
+    left_t.setStyle(TableStyle([
+        ('LEFTPADDING',   (0,0), (-1,-1), 8),
+        ('RIGHTPADDING',  (0,0), (-1,-1), 4),
+        ('TOPPADDING',    (0,0), (-1,-1), 3),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ('VALIGN',        (0,0), (-1,-1), 'TOP'),
     ]))
-    return t
 
+    right_rows = [
+        [Paragraph('QUOTE NUMBER',    S['meta_lbl']),
+         Paragraph('VALID UNTIL',     S['meta_lbl'])],
+        [Paragraph(f'<b>{quote_id}</b>', S['meta_bold']),
+         Paragraph('14 days from issue', S['meta_val'])],
+        [Spacer(1, 4), Spacer(1, 4)],
+        [Paragraph('PREPARED BY',     S['meta_lbl']),
+         Paragraph('QUOTE DATE',      S['meta_lbl'])],
+        [Paragraph(agent_name,        S['meta_val']),
+         Paragraph(gen_date,          S['meta_val'])],
+    ]
+    right_t = Table(right_rows, colWidths=[CW * 0.25, CW * 0.23])
+    right_t.setStyle(TableStyle([
+        ('LEFTPADDING',   (0,0), (-1,-1), 6),
+        ('RIGHTPADDING',  (0,0), (-1,-1), 4),
+        ('TOPPADDING',    (0,0), (-1,-1), 3),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 3),
+        ('VALIGN',        (0,0), (-1,-1), 'TOP'),
+    ]))
 
-# ─── HELPER: Info grid cell ──────────────────────────────────────
-def info_cell(label, value, styles, col_w):
-    return Table([
-        [Paragraph(label, styles["label"])],
-        [Paragraph(str(value) if value else "—", styles["value"])],
-    ], colWidths=[col_w - 6])
-
-
-# ══════════════════════════════════════════════════════════════════
-# QUOTE PDF v2
-# ══════════════════════════════════════════════════════════════════
-
-def generate_quote_pdf(data):
-    buffer  = io.BytesIO()
-    styles  = S()
-    agency  = data.get("agency_name", "SafariFlow")
-    symbol  = data.get("currency_symbol", "$")
-    ag_email = data.get("agent_email", "")
-    unsplash_key = data.get("unsplash_access_key", "")
-
-    doc = BaseDocTemplate(
-        buffer, pagesize=A4,
-        leftMargin=MARGIN, rightMargin=MARGIN,
-        topMargin=26*mm, bottomMargin=20*mm,
-    )
-    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="main")
-    template = PageTemplate(
-        id="main", frames=[frame],
-        onPage=lambda c, d: draw_page(c, d, agency, ag_email, "SAFARI QUOTE")
-    )
-    doc.addPageTemplates([template])
-    story = []
-
-    # ── HERO IMAGE ───────────────────────────────────────────────
-    hero_query = data.get("unsplash_hero_query", f"{data.get('destination', 'safari africa')} landscape")
-    hero_img = fetch_unsplash_image(hero_query, INNER_W, 55*mm, unsplash_key)
-    if hero_img:
-        hero_img.hAlign = "LEFT"
-        story.append(hero_img)
-        story.append(Spacer(1, 3*mm))
-
-    # ── HERO SECTION ─────────────────────────────────────────────
-    client_name = data.get("client_name", "Valued Client")
-    destination = data.get("destination", "")
-
-    hero = Table([[
-        Table([
-            [Paragraph("Safari Proposal prepared for", styles["label"])],
-            [Paragraph(client_name, styles["hero_name"])],
-            [Spacer(1, 3)],
-            [Paragraph(f"&#x2708;  {destination}", styles["hero_dest"])] if destination else [Spacer(1,1)],
-        ], colWidths=[INNER_W * 0.62]),
-        Table([
-            [Paragraph("QUOTE NUMBER", styles["label"])],
-            [Paragraph(data.get("quote_number", "—"), styles["value_gold"])],
-            [Spacer(1, 6)],
-            [Paragraph("VALID UNTIL", styles["label"])],
-            [Paragraph(data.get("valid_until", "—"), styles["value"])],
-            [Spacer(1, 6)],
-            [Paragraph("PREPARED BY", styles["label"])],
-            [Paragraph(data.get("agent_name", "—"), styles["value"])],
-        ], colWidths=[INNER_W * 0.35]),
-    ]], colWidths=[INNER_W * 0.65, INNER_W * 0.35])
-
+    hero = Table([[left_t, right_t]], colWidths=[CW * 0.52, CW * 0.48])
     hero.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), CREAM),
-        ("LEFTPADDING", (0,0), (-1,-1), 16),
-        ("RIGHTPADDING", (0,0), (-1,-1), 16),
-        ("TOPPADDING", (0,0), (-1,-1), 14),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 14),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("LINEBELOW", (0,0), (-1,-1), 2, GOLD),
-        ("LINEBEFORE", (1,0), (1,0), 1, BORDER),
+        ('VALIGN',        (0,0), (-1,-1), 'MIDDLE'),
+        ('LEFTPADDING',   (0,0), (-1,-1), 0),
+        ('RIGHTPADDING',  (0,0), (-1,-1), 0),
+        ('TOPPADDING',    (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+        ('BOX',           (0,0), (-1,-1), 0.4, RULE_CLR),
+        ('BACKGROUND',    (0,0), (-1,-1), SAND),
+        ('LINEAFTER',     (0,0), (0,-1),  0.4, RULE_CLR),
     ]))
     story.append(hero)
-    story.append(Spacer(1, 5*mm))
+    story.append(Spacer(1, 4 * mm))
 
-    # ── META GRID ────────────────────────────────────────────────
-    col_w = INNER_W / 4
-    meta = [
-        ("QUOTE DATE",    data.get("quote_date", "—")),
-        ("TRAVEL DATES",  data.get("travel_dates", "—")),
-        ("TRAVELERS",     str(data.get("num_travelers", "—"))),
-        ("DURATION",      f"{data.get('duration_days', '—')} Days"),
-    ]
-    meta_cells = [info_cell(l, v, styles, col_w) for l, v in meta]
-    meta_table = Table([meta_cells], colWidths=[col_w]*4)
-    meta_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), WHITE),
-        ("LINEBELOW", (0,0), (-1,-1), 0.8, GOLD),
-        ("LINEABOVE", (0,0), (-1,-1), 0.3, BORDER),
-        ("LINEBEFORE", (1,0), (1,0), 0.5, BORDER),
-        ("LINEBEFORE", (2,0), (2,0), 0.5, BORDER),
-        ("LINEBEFORE", (3,0), (3,0), 0.5, BORDER),
-        ("LEFTPADDING", (0,0), (-1,-1), 10),
-        ("TOPPADDING", (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+    # ── Trip meta strip ───────────────────────────────────────────────────────
+    col = CW / 4
+    meta_rows = [[
+        Paragraph('TRAVEL DATES',  S['meta_lbl']),
+        Paragraph('TRAVELERS',     S['meta_lbl']),
+        Paragraph('DURATION',      S['meta_lbl']),
+        Paragraph('',              S['meta_lbl']),
+    ],[
+        Paragraph(f"{start} – {end}", S['meta_val']),
+        Paragraph(pax_str,            S['meta_val']),
+        Paragraph(f"{nights} Days",   S['meta_val']),
+        Paragraph('',                 S['meta_val']),
+    ]]
+    mt = Table(meta_rows, colWidths=[col, col, col, col])
+    mt.setStyle(TableStyle([
+        ('ALIGN',         (0,0), (-1,-1), 'LEFT'),
+        ('VALIGN',        (0,0), (-1,-1), 'TOP'),
+        ('TOPPADDING',    (0,0), (-1,-1), 5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+        ('LEFTPADDING',   (0,0), (-1,-1), 8),
+        ('BACKGROUND',    (0,0), (-1,-1), SAND),
+        ('BOX',           (0,0), (-1,-1), 0.4, RULE_CLR),
+        ('INNERGRID',     (0,0), (-1,-1), 0.3, RULE_CLR),
     ]))
-    story.append(meta_table)
-    story.append(Spacer(1, 6*mm))
+    story.append(mt)
+    story.append(Spacer(1, 4 * mm))
 
-    # ── CLIENT + AGENT INFO ──────────────────────────────────────
-    half = INNER_W * 0.48
-    client_block = Table([
-        [Paragraph("CLIENT INFORMATION", styles["section_title"])],
-        [Spacer(1, 4)],
-        [Paragraph("Name", styles["label"])],
-        [Paragraph(data.get("client_name", "—"), styles["body"])],
-        [Spacer(1, 3)],
-        [Paragraph("Email", styles["label"])],
-        [Paragraph(data.get("client_email", "—"), styles["body"])],
-        [Spacer(1, 3)],
-        [Paragraph("Nationality", styles["label"])],
-        [Paragraph(data.get("client_nationality", "—") or "—", styles["body"])],
-    ], colWidths=[half])
+    # ── Client information ────────────────────────────────────────────────────
+    story.append(Paragraph('CLIENT INFORMATION', S['section']))
+    story.append(hr())
 
-    agent_block = Table([
-        [Paragraph("YOUR TRAVEL SPECIALIST", styles["section_title"])],
-        [Spacer(1, 4)],
-        [Paragraph("Agent", styles["label"])],
-        [Paragraph(data.get("agent_name", "—"), styles["body"])],
-        [Spacer(1, 3)],
-        [Paragraph("Email", styles["label"])],
-        [Paragraph(data.get("agent_email", "—"), styles["body"])],
-        [Spacer(1, 3)],
-        [Paragraph("Agency", styles["label"])],
-        [Paragraph(data.get("agency_name", "—"), styles["body"])],
-    ], colWidths=[half])
-
-    info_row = Table([[client_block, agent_block]], colWidths=[INNER_W*0.5, INNER_W*0.5])
-    info_row.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), CREAM),
-        ("LEFTPADDING", (0,0), (-1,-1), 14),
-        ("RIGHTPADDING", (0,0), (-1,-1), 14),
-        ("TOPPADDING", (0,0), (-1,-1), 12),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 12),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("LINEBEFORE", (1,0), (1,0), 0.8, GOLD),
+    ci_rows = [[
+        Paragraph('Name',        S['meta_lbl']),
+        Paragraph('Email',       S['meta_lbl']),
+        Paragraph('Nationality', S['meta_lbl']),
+    ],[
+        Paragraph(client_name,                  S['meta_val']),
+        Paragraph(safe(client.get('email')),    S['meta_val']),
+        Paragraph(nationality,                  S['meta_val']),
+    ]]
+    ci = Table(ci_rows, colWidths=[CW/3, CW/3, CW/3])
+    ci.setStyle(TableStyle([
+        ('ALIGN',         (0,0), (-1,-1), 'LEFT'),
+        ('VALIGN',        (0,0), (-1,-1), 'TOP'),
+        ('TOPPADDING',    (0,0), (-1,-1), 4),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+        ('LEFTPADDING',   (0,0), (-1,-1), 0),
     ]))
-    story.append(info_row)
-    story.append(Spacer(1, 6*mm))
+    story.append(ci)
+    story.append(Spacer(1, 3 * mm))
 
-    # ── INTRODUCTION NARRATIVE ───────────────────────────────────
-    intro = data.get("introduction", "")
-    if intro:
-        story.append(section_divider(styles, "YOUR SAFARI OVERVIEW"))
-        story.append(Spacer(1, 3*mm))
-        intro_box = Table([[Paragraph(intro, styles["narrative_intro"])]],
-            colWidths=[INNER_W])
-        intro_box.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), GOLD_BG),
-            ("LEFTPADDING", (0,0), (-1,-1), 16),
-            ("RIGHTPADDING", (0,0), (-1,-1), 16),
-            ("TOPPADDING", (0,0), (-1,-1), 12),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 12),
-            ("LINEBEFORE", (0,0), (-1,-1), 3, GOLD),
-        ]))
-        story.append(intro_box)
-        story.append(Spacer(1, 6*mm))
+    # ── Travel specialist ─────────────────────────────────────────────────────
+    story.append(Paragraph('YOUR TRAVEL SPECIALIST', S['section']))
+    story.append(hr())
 
-    # ── DAY BY DAY ITINERARY ─────────────────────────────────────
-    days = data.get("days", [])
-    if days:
-        story.append(section_divider(styles, "YOUR DAY-BY-DAY ITINERARY"))
-        story.append(Spacer(1, 3*mm))
+    ts_rows = [[
+        Paragraph('Agent',  S['meta_lbl']),
+        Paragraph('Email',  S['meta_lbl']),
+        Paragraph('Agency', S['meta_lbl']),
+    ],[
+        Paragraph(agent_name,  S['meta_val']),
+        Paragraph(agent_email, S['meta_val']),
+        Paragraph(agency,      S['meta_val']),
+    ]]
+    ts = Table(ts_rows, colWidths=[CW/3, CW/3, CW/3])
+    ts.setStyle(TableStyle([
+        ('ALIGN',         (0,0), (-1,-1), 'LEFT'),
+        ('VALIGN',        (0,0), (-1,-1), 'TOP'),
+        ('TOPPADDING',    (0,0), (-1,-1), 4),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+        ('LEFTPADDING',   (0,0), (-1,-1), 0),
+    ]))
+    story.append(ts)
+    story.append(Spacer(1, 4 * mm))
 
-        for day in days:
-            day_num   = day.get("day_number", "")
-            day_title = day.get("title", "")
-            day_dest  = day.get("destination", "")
-            narrative = day.get("narrative", "")
-            highlight = day.get("highlight", "")
-            accom     = day.get("accommodation_description", "")
-            img_query = day.get("image_search_query", f"{day_dest} safari")
 
-            # Day image
-            day_img = fetch_unsplash_image(img_query, INNER_W, 40*mm, unsplash_key)
+# ─── Section 2: Overview narrative ───────────────────────────────────────────
+def build_overview(data, S, story):
+    intro = safe(data.get('narrative', {}).get('intro'), '')
+    if not intro or intro == '—':
+        return
+    story.append(Paragraph('YOUR SAFARI OVERVIEW', S['section']))
+    story.append(hr())
+    story.append(Spacer(1, 2 * mm))
+    story.append(Paragraph(intro, S['italic']))
+    story.append(Spacer(1, 4 * mm))
 
-            # Day header
-            day_hdr = Table([[
-                Paragraph(f"DAY {day_num}", ParagraphStyle("dn",
-                    fontSize=8, fontName="Helvetica-Bold",
-                    textColor=GOLD, leading=12)),
-                Paragraph(f"<b>{day_title}</b>", ParagraphStyle("dt",
-                    fontSize=11, fontName="Helvetica-Bold",
-                    textColor=WHITE, leading=15)),
-                Paragraph(day_dest, ParagraphStyle("dd",
-                    fontSize=8.5, fontName="Helvetica",
-                    textColor=colors.HexColor("#9AABBF"),
-                    leading=12, alignment=TA_RIGHT)),
-            ]], colWidths=[INNER_W*0.1, INNER_W*0.63, INNER_W*0.27])
-            day_hdr.setStyle(TableStyle([
-                ("BACKGROUND", (0,0), (-1,-1), NAVY),
-                ("LEFTPADDING", (0,0), (-1,-1), 12),
-                ("RIGHTPADDING", (0,0), (-1,-1), 12),
-                ("TOPPADDING", (0,0), (-1,-1), 8),
-                ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-                ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-                ("LINEBELOW", (0,0), (-1,-1), 1.5, GOLD),
-            ]))
 
-            # Day content
-            day_content = []
-            if day_img:
-                day_content.append(day_img)
-                day_content.append(Spacer(1, 2*mm))
+# ─── Section 3: Day-by-day itinerary ─────────────────────────────────────────
+def build_itinerary(data, S, story):
+    itinerary = data.get('itinerary', [])
+    narr_days = data.get('narrative', {}).get('days', [])
 
-            if narrative:
-                day_content.append(Paragraph(narrative, styles["day_narrative"]))
-                day_content.append(Spacer(1, 2*mm))
-
-            if highlight:
-                day_content.append(Paragraph(f"&#x2728; {highlight}", styles["highlight"]))
-                day_content.append(Spacer(1, 2*mm))
-
-            if accom:
-                day_content.append(Paragraph(f"<b>Accommodation:</b> {accom}",
-                    styles["body_mid"]))
-
-            content_table = Table([[day_content]], colWidths=[INNER_W])
-            content_table.setStyle(TableStyle([
-                ("BACKGROUND", (0,0), (-1,-1), CREAM),
-                ("LEFTPADDING", (0,0), (-1,-1), 14),
-                ("RIGHTPADDING", (0,0), (-1,-1), 14),
-                ("TOPPADDING", (0,0), (-1,-1), 10),
-                ("BOTTOMPADDING", (0,0), (-1,-1), 10),
-                ("LINEBELOW", (0,0), (-1,-1), 0.5, BORDER),
-            ]))
-
-            story.append(KeepTogether([day_hdr, content_table, Spacer(1, 3*mm)]))
-
-        story.append(Spacer(1, 3*mm))
-
-    # ── QUOTE BREAKDOWN ──────────────────────────────────────────
-    story.append(section_divider(styles, "INVESTMENT BREAKDOWN"))
-    story.append(Spacer(1, 2*mm))
-
-    col_widths = [INNER_W*0.31, INNER_W*0.32, INNER_W*0.08, INNER_W*0.15, INNER_W*0.14]
-    header_row = [
-        Paragraph("DESCRIPTION", styles["label"]),
-        Paragraph("DETAILS", styles["label"]),
-        Paragraph("QTY", styles["label"]),
-        Paragraph("UNIT PRICE", styles["label"]),
-        Paragraph("TOTAL", styles["label"]),
-    ]
-
-    rows = [header_row]
-    subtotal = 0
-
-    for item in data.get("items", []):
+    narr_idx = {}
+    for d in narr_days:
         try:
-            up   = float(item.get("unit_price", 0))
-            qty  = float(item.get("quantity", 1))
-            line = up * qty
-            subtotal += line
-        except:
-            line = 0
+            narr_idx[int(d.get('day_number', 0))] = d
+        except (TypeError, ValueError):
+            pass
 
-        rows.append([
-            Paragraph(item.get("description",""), styles["item_desc"]),
-            Paragraph(item.get("details",""), styles["item_detail"]),
-            Paragraph(str(item.get("quantity",1)), styles["body"]),
-            Paragraph(fmt_currency(item.get("unit_price",0), symbol), styles["price"]),
-            Paragraph(fmt_currency(line, symbol), styles["price_bold"]),
-        ])
+    story.append(Paragraph('YOUR DAY-BY-DAY ITINERARY', S['section']))
+    story.append(hr())
+    story.append(Spacer(1, 3 * mm))
 
-    items_table = Table(rows, colWidths=col_widths, repeatRows=1)
-    row_colors  = [("BACKGROUND", (0,i), (-1,i), WHITE if i%2==1 else LIGHT_GREY)
-                   for i in range(1, len(rows))]
+    for day in itinerary:
+        try:
+            num = int(day.get('day_number', 0))
+        except (TypeError, ValueError):
+            num = 0
 
-    items_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), NAVY),
-        ("TEXTCOLOR", (0,0), (-1,0), GOLD),
-        ("LINEBELOW", (0,0), (-1,0), 1.5, GOLD),
-        ("LEFTPADDING", (0,0), (-1,-1), 9),
-        ("RIGHTPADDING", (0,0), (-1,-1), 9),
-        ("TOPPADDING", (0,0), (-1,-1), 7),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 7),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("LINEBELOW", (0,1), (-1,-1), 0.3, BORDER),
-        ("LINEBEFORE", (4,0), (4,-1), 0.5, BORDER),
-    ] + row_colors))
+        narr       = narr_idx.get(num, {})
+        dest       = safe(day.get('destination'))
+        title      = safe(day.get('title'), dest)
+        img_query  = safe(day.get('image_search_query'), f"{dest} safari")
+        narr_text  = safe(narr.get('narrative'), '')
+        highlight  = safe(narr.get('highlight'), '')
+        accom      = safe(day.get('accommodation_name'))
+        accom_desc = safe(narr.get('accommodation_description'), '')
+        room       = safe(day.get('room_type'))
+        meals      = safe(day.get('meal_plan'))
+        transport  = safe(day.get('transport_description'), '')
 
-    story.append(items_table)
-    story.append(Spacer(1, 1*mm))
+        elems = []
 
-    # ── TOTAL BANNER ─────────────────────────────────────────────
-    grand_total = subtotal - float(data.get("discount", 0))
-    deposit_pct = float(data.get("deposit_percentage", 30))
-    deposit_amt = grand_total * (deposit_pct / 100)
-    balance_amt = grand_total - deposit_amt
+        # Destination placeholder bar (photo integration — later phase)
+        elems.append(DestinationBar(dest))
+        elems.append(Spacer(1, 2 * mm))
 
-    total_banner = Table([[
-        Paragraph("TOTAL INVESTMENT", styles["total_label"]),
-        Paragraph(fmt_currency(grand_total, symbol), styles["total_amount"]),
-    ]], colWidths=[INNER_W*0.55, INNER_W*0.45])
-    total_banner.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), NAVY),
-        ("LEFTPADDING", (0,0), (-1,-1), 16),
-        ("RIGHTPADDING", (0,0), (-1,-1), 16),
-        ("TOPPADDING", (0,0), (-1,-1), 12),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 12),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("LINEABOVE", (0,0), (-1,-1), 2, GOLD),
-    ]))
-    story.append(total_banner)
-    story.append(Spacer(1, 2*mm))
-
-    # Deposit breakdown
-    deposit_row = Table([[
-        Table([
-            [Paragraph("DEPOSIT REQUIRED", styles["label"])],
-            [Paragraph(f"{fmt_currency(deposit_amt, symbol)}  ({int(deposit_pct)}%)", styles["value_gold"])],
-        ], colWidths=[INNER_W*0.48]),
-        Table([
-            [Paragraph("BALANCE DUE", styles["label"])],
-            [Paragraph(fmt_currency(balance_amt, symbol), styles["value"])],
-        ], colWidths=[INNER_W*0.48]),
-    ]], colWidths=[INNER_W*0.5, INNER_W*0.5])
-    deposit_row.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), GOLD_BG),
-        ("LEFTPADDING", (0,0), (-1,-1), 16),
-        ("RIGHTPADDING", (0,0), (-1,-1), 16),
-        ("TOPPADDING", (0,0), (-1,-1), 10),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 10),
-        ("LINEBEFORE", (1,0), (1,-1), 0.8, GOLD),
-        ("LINEBELOW", (0,-1), (-1,-1), 1, GOLD),
-    ]))
-    story.append(deposit_row)
-    story.append(Spacer(1, 6*mm))
-
-    # ── INCLUSIONS / EXCLUSIONS ──────────────────────────────────
-    notes_raw = data.get("notes", "")
-    inc_text  = ""
-    exc_text  = ""
-    base_note = notes_raw
-
-    if "Package includes:" in notes_raw:
-        parts = notes_raw.split("Package includes:")
-        base_note = parts[0].strip()
-        rest = parts[1]
-        if "Not included:" in rest:
-            inc_text, exc_text = rest.split("Not included:")
-        else:
-            inc_text = rest
-
-    if inc_text or exc_text:
-        inc_items = [i.strip() for i in inc_text.split(",") if i.strip()]
-        exc_items = [i.strip() for i in exc_text.split(",") if i.strip()]
-
-        inc_content = [Paragraph("INCLUDED IN THIS PACKAGE", styles["inc_title"]), Spacer(1, 5)]
-        for it in inc_items:
-            inc_content.append(Paragraph(f"<b>&#x2713;</b>  {it}", styles["inc_item"]))
-            inc_content.append(Spacer(1, 2))
-
-        exc_content = [Paragraph("NOT INCLUDED", styles["exc_title"]), Spacer(1, 5)]
-        for it in exc_items:
-            exc_content.append(Paragraph(f"<b>&#x2715;</b>  {it}", styles["inc_item"]))
-            exc_content.append(Spacer(1, 2))
-
-        ie_table = Table([[inc_content, exc_content]], colWidths=[INNER_W/2, INNER_W/2])
-        ie_table.setStyle(TableStyle([
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#F0FAF3")),
-            ("BACKGROUND", (1,0), (1,-1), colors.HexColor("#FEF5F5")),
-            ("LEFTPADDING", (0,0), (-1,-1), 14),
-            ("RIGHTPADDING", (0,0), (-1,-1), 14),
-            ("TOPPADDING", (0,0), (-1,-1), 12),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 12),
-            ("LINEBEFORE", (1,0), (1,-1), 1, BORDER),
-            ("LINEBELOW", (0,-1), (-1,-1), 0.5, BORDER),
+        # Day number + destination header
+        dh = Table([[
+            Paragraph(f"DAY {num}", S['day_num']),
+            Paragraph(dest,         S['day_dest']),
+        ]], colWidths=[CW * 0.5, CW * 0.5])
+        dh.setStyle(TableStyle([
+            ('VALIGN',        (0,0), (-1,-1), 'MIDDLE'),
+            ('LEFTPADDING',   (0,0), (-1,-1), 0),
+            ('RIGHTPADDING',  (0,0), (-1,-1), 0),
+            ('TOPPADDING',    (0,0), (-1,-1), 0),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 2),
         ]))
-        story.append(ie_table)
-        story.append(Spacer(1, 5*mm))
+        elems.append(dh)
+        elems.append(Paragraph(title, S['day_title']))
+        elems.append(Spacer(1, 2 * mm))
 
-    # ── NOTES ────────────────────────────────────────────────────
-    if base_note:
-        story.append(section_divider(styles, "NOTES & CONDITIONS"))
-        story.append(Spacer(1, 2*mm))
-        notes_table = Table([[Paragraph(base_note, styles["note"])]], colWidths=[INNER_W])
-        notes_table.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), GOLD_BG),
-            ("LEFTPADDING", (0,0), (-1,-1), 14),
-            ("RIGHTPADDING", (0,0), (-1,-1), 14),
-            ("TOPPADDING", (0,0), (-1,-1), 10),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 10),
-            ("LINEBEFORE", (0,0), (-1,-1), 3, GOLD),
-            ("LINEBELOW", (0,0), (-1,-1), 1, GOLD),
+        if narr_text and narr_text != '—':
+            elems.append(Paragraph(narr_text, S['body']))
+            elems.append(Spacer(1, 2 * mm))
+
+        if highlight and highlight != '—':
+            elems.append(Paragraph(f"■  {highlight}", S['highlight']))
+            elems.append(Spacer(1, 2 * mm))
+
+        accom_full = f"{accom} — {accom_desc}" if accom_desc != '—' else accom
+        elems.append(Paragraph(
+            f"<b>Accommodation:</b> {accom_full}, {room}  |  <b>Meals:</b> {meals}",
+            S['body_sm']
+        ))
+
+        if transport and transport not in ('—', 'null', 'None'):
+            elems.append(Paragraph(
+                f"<b>Transfer:</b> {transport}", S['body_sm']
+            ))
+
+        elems.append(Spacer(1, 3 * mm))
+        elems.append(hr(color=RULE_CLR, thickness=0.3, sb=0, sa=4))
+
+        story.append(KeepTogether(elems))
+
+
+# ─── Section 4: Investment breakdown ─────────────────────────────────────────
+def build_pricing(data, S, story):
+    line_items = data.get('line_items', [])
+    pricing    = data.get('pricing', {})
+
+    story.append(PageBreak())
+    story.append(Paragraph('INVESTMENT BREAKDOWN', S['section']))
+    story.append(hr())
+    story.append(Spacer(1, 3 * mm))
+
+    if line_items:
+        rows = [[
+            Paragraph('DESCRIPTION', S['th']),
+            Paragraph('DETAILS',     S['th']),
+            Paragraph('QTY',         S['th']),
+            Paragraph('UNIT PRICE',  S['th']),
+            Paragraph('TOTAL',       S['th']),
+        ]]
+        for item in line_items:
+            rows.append([
+                Paragraph(safe(item.get('description')), S['td']),
+                Paragraph(safe(item.get('details')),     S['td']),
+                Paragraph(str(safe(item.get('quantity'))), S['td']),
+                Paragraph(usd(item.get('unit_price')),   S['td_r']),
+                Paragraph(usd(item.get('total_price')),  S['td_r']),
+            ])
+
+        t = Table(rows, colWidths=[58*mm, 52*mm, 10*mm, 27*mm, 27*mm],
+                  repeatRows=1)
+        t.setStyle(TableStyle([
+            ('BACKGROUND',    (0,0),  (-1,0),  EARTH),
+            ('ROWBACKGROUNDS',(0,1),  (-1,-1), [white, TABLE_ALT]),
+            ('ALIGN',         (3,0),  (-1,-1), 'RIGHT'),
+            ('ALIGN',         (0,0),  (2,-1),  'LEFT'),
+            ('VALIGN',        (0,0),  (-1,-1), 'TOP'),
+            ('TOPPADDING',    (0,0),  (-1,-1), 5),
+            ('BOTTOMPADDING', (0,0),  (-1,-1), 5),
+            ('LEFTPADDING',   (0,0),  (-1,-1), 5),
+            ('RIGHTPADDING',  (0,0),  (-1,-1), 5),
+            ('LINEBELOW',     (0,0),  (-1,-1), 0.25, RULE_CLR),
         ]))
-        story.append(notes_table)
-        story.append(Spacer(1, 5*mm))
+        story.append(t)
 
-    # ── ACTION BUTTONS (Accept / Change / Reject) ────────────────
-    accept_url  = data.get("accept_url", "")
-    changes_url = data.get("changes_url", "")
+    story.append(Spacer(1, 5 * mm))
 
-    if accept_url or changes_url:
-        story.append(section_divider(styles, "RESPOND TO THIS QUOTE"))
-        story.append(Spacer(1, 3*mm))
+    total   = usd(pricing.get('total_price_usd'))
+    deposit = usd(pricing.get('deposit_amount_usd'))
+    balance = usd(pricing.get('balance_amount_usd'))
+    notes   = safe(pricing.get('budget_notes'), '')
 
-        btn_cells = []
-        if accept_url:
-            btn_cells.append(Table([[
-                Paragraph("&#x2705; ACCEPT THIS QUOTE",
-                    ParagraphStyle("btn_accept", fontSize=10,
-                    fontName="Helvetica-Bold", textColor=WHITE,
-                    leading=14, alignment=TA_CENTER)),
-                Paragraph(accept_url,
-                    ParagraphStyle("btn_url", fontSize=7,
-                    fontName="Helvetica", textColor=GOLD_LIGHT,
-                    leading=10, alignment=TA_CENTER)),
-            ]], colWidths=[INNER_W*0.46]))
+    totals = [
+        [Paragraph('TOTAL INVESTMENT',     S['total_lbl']),
+         Paragraph(total,                  S['total_val'])],
+        [Paragraph('DEPOSIT REQUIRED (30%)', S['total_lbl']),
+         Paragraph(deposit,                S['td_r'])],
+        [Paragraph('BALANCE DUE',          S['total_lbl']),
+         Paragraph(balance,                S['td_r'])],
+    ]
+    tt = Table(totals, colWidths=[CW - 50*mm, 50*mm])
+    tt.setStyle(TableStyle([
+        ('ALIGN',         (0,0), (-1,-1), 'RIGHT'),
+        ('VALIGN',        (0,0), (-1,-1), 'MIDDLE'),
+        ('TOPPADDING',    (0,0), (-1,-1), 4),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+        ('LINEABOVE',     (0,0), (-1,0),  0.5, GOLD),
+        ('LINEBELOW',     (0,2), (-1,2),  0.5, GOLD),
+        ('BACKGROUND',    (0,0), (-1,0),  SAND),
+    ]))
+    story.append(tt)
 
-        if changes_url:
-            btn_cells.append(Table([[
-                Paragraph("&#x270F; REQUEST CHANGES",
-                    ParagraphStyle("btn_change", fontSize=10,
-                    fontName="Helvetica-Bold", textColor=WHITE,
-                    leading=14, alignment=TA_CENTER)),
-                Paragraph(changes_url,
-                    ParagraphStyle("btn_url2", fontSize=7,
-                    fontName="Helvetica", textColor=GOLD_LIGHT,
-                    leading=10, alignment=TA_CENTER)),
-            ]], colWidths=[INNER_W*0.46]))
+    if notes and notes != '—':
+        story.append(Spacer(1, 3 * mm))
+        story.append(Paragraph(f"Note: {notes}", S['muted']))
 
-        if btn_cells:
-            btn_table = Table([btn_cells],
-                colWidths=[INNER_W*0.5] * len(btn_cells))
-            btn_table.setStyle(TableStyle([
-                ("BACKGROUND", (0,0), (0,-1), GREEN),
-                ("BACKGROUND", (1,0), (1,-1), NAVY_MID) if len(btn_cells) > 1 else ("BACKGROUND", (0,0), (-1,-1), GREEN),
-                ("LEFTPADDING", (0,0), (-1,-1), 16),
-                ("RIGHTPADDING", (0,0), (-1,-1), 16),
-                ("TOPPADDING", (0,0), (-1,-1), 12),
-                ("BOTTOMPADDING", (0,0), (-1,-1), 12),
-                ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-                ("LINEBEFORE", (1,0), (1,-1), 1, WHITE) if len(btn_cells) > 1 else ("LINEABOVE", (0,0), (-1,-1), 0, WHITE),
-            ]))
-            story.append(btn_table)
-            story.append(Spacer(1, 6*mm))
+    story.append(Spacer(1, 6 * mm))
 
-    # ══════════════════════════════════════════════════════════════
-    # AGENCY TRUST PAGE (new last page)
-    # ══════════════════════════════════════════════════════════════
+
+# ─── Section 5: Inclusions / Terms / Respond ─────────────────────────────────
+def build_inclusions_terms(data, S, story):
+    inclusions  = safe(data.get('inclusions'), '')
+    exclusions  = safe(data.get('exclusions'), '')
+    terms       = safe(data.get('terms'), '')
+    accept_url  = safe(data.get('accept_url'), '#')
+    changes_url = safe(data.get('changes_url'), '#')
+
+    col_w = (CW - 6*mm) / 2
+    left_elems = []
+    right_elems = []
+
+    if inclusions and inclusions != '—':
+        left_elems.append(Paragraph('INCLUDED IN THIS PACKAGE', S['section']))
+        left_elems.append(hr(width=col_w))
+        for line in inclusions.split('\n'):
+            line = line.strip().lstrip('-•✓').strip()
+            if line:
+                left_elems.append(Paragraph(f"✓  {line}", S['body_sm']))
+
+    if exclusions and exclusions != '—':
+        right_elems.append(Paragraph('NOT INCLUDED', S['section']))
+        right_elems.append(hr(width=col_w))
+        for line in exclusions.split('\n'):
+            line = line.strip().lstrip('-•✕✗').strip()
+            if line:
+                right_elems.append(Paragraph(f"✕  {line}", S['body_sm']))
+
+    if left_elems or right_elems:
+        inc_t = Table([[left_elems, right_elems]],
+                      colWidths=[col_w, col_w])
+        inc_t.setStyle(TableStyle([
+            ('VALIGN',       (0,0), (-1,-1), 'TOP'),
+            ('LEFTPADDING',  (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+            ('TOPPADDING',   (0,0), (-1,-1), 0),
+        ]))
+        story.append(inc_t)
+
+    if terms and terms != '—':
+        story.append(Spacer(1, 3 * mm))
+        story.append(Paragraph('NOTES & CONDITIONS', S['section']))
+        story.append(hr())
+        story.append(Paragraph(terms, S['muted']))
+
+    # Respond section
+    story.append(Spacer(1, 5 * mm))
+    story.append(Paragraph('RESPOND TO THIS QUOTE', S['section']))
+    story.append(hr(color=GOLD, thickness=0.6))
+    story.append(Spacer(1, 2 * mm))
+
+    rt = Table([[
+        Paragraph('■ <b>ACCEPT THIS QUOTE</b>', S['body_sm']),
+        Paragraph(accept_url, S['muted']),
+        Paragraph('✏ <b>REQUEST CHANGES</b>', S['body_sm']),
+        Paragraph(changes_url, S['muted']),
+    ]], colWidths=[35*mm, CW/2 - 35*mm, 35*mm, CW/2 - 35*mm])
+    rt.setStyle(TableStyle([
+        ('VALIGN',        (0,0), (-1,-1), 'TOP'),
+        ('LEFTPADDING',   (0,0), (-1,-1), 0),
+        ('TOPPADDING',    (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+    ]))
+    story.append(rt)
+
+
+# ─── Section 6: Agent trust page ─────────────────────────────────────────────
+def build_trust_page(data, S, story):
+    agent   = data.get('agent', {})
+    profile = data.get('agent_profile', {})
+    reviews = data.get('agent_reviews', [])
+
+    agency      = safe(agent.get('agency'), 'Safari Agency')
+    tagline     = safe(profile.get('tagline'), 'Travel & Safari Specialists')
+    bio         = safe(profile.get('bio'), '')
+    years_exp   = safe(profile.get('years_experience'), '10+')
+    safaris     = safe(profile.get('safaris_planned'), '500+')
+    countries   = safe(profile.get('countries_covered'), '15')
+    awards      = profile.get('awards', [])
+    memberships = profile.get('memberships', [])
+    email       = safe(agent.get('email'))
+    phone       = safe(agent.get('phone'))
+    website     = safe(agent.get('website'), '')
+    address     = safe(profile.get('address'), '')
+    facebook    = safe(profile.get('facebook'), '')
+    instagram   = safe(profile.get('instagram'), '')
+    linkedin    = safe(profile.get('linkedin'), '')
+
     story.append(PageBreak())
 
-    profile  = data.get("agent_profile", {})
-    reviews  = data.get("agent_reviews", [])
+    # Navy header band
+    story.append(HeaderBand(agency, tagline))
+    story.append(Spacer(1, 5 * mm))
 
-    # Agency header
-    agency_hdr = Table([[
-        Paragraph(agency.upper(), ParagraphStyle("ap_name",
-            fontSize=18, fontName="Helvetica-Bold",
-            textColor=WHITE, leading=24)),
-        Paragraph("TRAVEL & SAFARI SPECIALISTS", ParagraphStyle("ap_tag",
-            fontSize=9, fontName="Helvetica",
-            textColor=GOLD, leading=13, alignment=TA_RIGHT)),
-    ]], colWidths=[INNER_W*0.65, INNER_W*0.35])
-    agency_hdr.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), NAVY),
-        ("LEFTPADDING", (0,0), (-1,-1), 16),
-        ("RIGHTPADDING", (0,0), (-1,-1), 16),
-        ("TOPPADDING", (0,0), (-1,-1), 16),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 16),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("LINEBELOW", (0,0), (-1,-1), 2, GOLD),
-    ]))
-    story.append(agency_hdr)
-    story.append(Spacer(1, 4*mm))
+    # Agency name + tagline
+    story.append(Table([[
+        Paragraph(agency.upper(), S['agent_name']),
+        Paragraph(tagline.upper(), S['agent_tag']),
+    ]], colWidths=[CW * 0.6, CW * 0.4]))
+    story.append(Spacer(1, 2 * mm))
 
     # Bio
-    bio = profile.get("bio", "")
-    if bio:
-        bio_table = Table([[Paragraph(bio, styles["bio"])]], colWidths=[INNER_W])
-        bio_table.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), CREAM),
-            ("LEFTPADDING", (0,0), (-1,-1), 16),
-            ("RIGHTPADDING", (0,0), (-1,-1), 16),
-            ("TOPPADDING", (0,0), (-1,-1), 12),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 12),
-            ("LINEBEFORE", (0,0), (-1,-1), 3, GOLD),
+    if bio and bio != '—':
+        story.append(Paragraph(bio, S['agent_bio']))
+
+    story.append(Spacer(1, 4 * mm))
+    story.append(hr(color=GOLD, thickness=0.5))
+    story.append(Spacer(1, 4 * mm))
+
+    # ── Stats strip ───────────────────────────────────────────────────────────
+    stat_col = CW / 3
+    stats_data = [[
+        [Paragraph('■', S['stat_num']),
+         Paragraph(years_exp, S['stat_num']),
+         Paragraph('Years Experience', S['stat_lbl'])],
+        [Paragraph('■', S['stat_num']),
+         Paragraph(safaris, S['stat_num']),
+         Paragraph('Safaris Planned', S['stat_lbl'])],
+        [Paragraph('■', S['stat_num']),
+         Paragraph(countries, S['stat_num']),
+         Paragraph('Countries Covered', S['stat_lbl'])],
+    ]]
+    stats = Table(stats_data, colWidths=[stat_col, stat_col, stat_col])
+    stats.setStyle(TableStyle([
+        ('ALIGN',         (0,0), (-1,-1), 'CENTER'),
+        ('VALIGN',        (0,0), (-1,-1), 'TOP'),
+        ('TOPPADDING',    (0,0), (-1,-1), 6),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+        ('BACKGROUND',    (0,0), (-1,-1), SAND),
+        ('BOX',           (0,0), (-1,-1), 0.3, RULE_CLR),
+        ('INNERGRID',     (0,0), (-1,-1), 0.3, RULE_CLR),
+    ]))
+    story.append(stats)
+    story.append(Spacer(1, 5 * mm))
+
+    # ── Awards + Memberships ──────────────────────────────────────────────────
+    col_w = (CW - 6*mm) / 2
+    left_elems = []
+    right_elems = []
+
+    if awards:
+        left_elems.append(Paragraph('AWARDS & RECOGNITION', S['section']))
+        left_elems.append(hr(width=col_w))
+        for a in awards:
+            left_elems.append(Paragraph(f"■  {safe(a)}", S['award']))
+        left_elems.append(Spacer(1, 3 * mm))
+
+    if memberships:
+        right_elems.append(Paragraph('MEMBERSHIPS & ACCREDITATIONS', S['section']))
+        right_elems.append(hr(width=col_w))
+        for m in memberships:
+            right_elems.append(Paragraph(f"✓  {safe(m)}", S['award']))
+        right_elems.append(Spacer(1, 3 * mm))
+
+    if left_elems or right_elems:
+        am_t = Table([[left_elems, right_elems]],
+                     colWidths=[col_w, col_w])
+        am_t.setStyle(TableStyle([
+            ('VALIGN',       (0,0), (-1,-1), 'TOP'),
+            ('LEFTPADDING',  (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+            ('TOPPADDING',   (0,0), (-1,-1), 0),
         ]))
-        story.append(bio_table)
-        story.append(Spacer(1, 4*mm))
+        story.append(am_t)
 
-    # Stats strip
-    yrs  = str(profile.get("years_experience", ""))
-    saf  = str(profile.get("safaris_completed", ""))
-    ctr  = str(profile.get("countries_covered", ""))
+    story.append(Spacer(1, 4 * mm))
 
-    if yrs or saf or ctr:
-        stat_cells = []
-        for icon, num, lbl in [("&#x1F3C6;", f"{yrs} Years", "Experience"),
-                                ("&#x1F43E;", f"{saf}+", "Safaris Planned"),
-                                ("&#x1F30D;", f"{ctr}", "Countries Covered")]:
-            stat_cells.append(Table([
-                [Paragraph(icon, ParagraphStyle("si", fontSize=18,
-                    fontName="Helvetica", leading=24, alignment=TA_CENTER))],
-                [Paragraph(num, ParagraphStyle("sn", fontSize=12,
-                    fontName="Helvetica-Bold", textColor=NAVY,
-                    leading=16, alignment=TA_CENTER))],
-                [Paragraph(lbl, ParagraphStyle("sl", fontSize=8,
-                    fontName="Helvetica", textColor=TEXT_LIGHT,
-                    leading=11, alignment=TA_CENTER))],
-            ], colWidths=[INNER_W/3 - 8]))
-
-        stats_table = Table([stat_cells], colWidths=[INNER_W/3]*3)
-        stats_table.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), WHITE),
-            ("LEFTPADDING", (0,0), (-1,-1), 8),
-            ("RIGHTPADDING", (0,0), (-1,-1), 8),
-            ("TOPPADDING", (0,0), (-1,-1), 12),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 12),
-            ("LINEBEFORE", (1,0), (1,-1), 0.5, BORDER),
-            ("LINEBEFORE", (2,0), (2,-1), 0.5, BORDER),
-            ("LINEBELOW", (0,-1), (-1,-1), 1, GOLD),
-            ("LINEABOVE", (0,0), (-1,0), 0.5, BORDER),
-        ]))
-        story.append(stats_table)
-        story.append(Spacer(1, 4*mm))
-
-    # Awards & Memberships
-    awards      = profile.get("awards", [])
-    memberships = profile.get("memberships", [])
-
-    if awards or memberships:
-        aw_content = []
-        if awards:
-            aw_content.append(Paragraph("AWARDS & RECOGNITION", styles["inc_title"]))
-            aw_content.append(Spacer(1, 4))
-            for a in awards:
-                aw_content.append(Paragraph(f"&#x1F3C6;  {a}", styles["award_item"]))
-                aw_content.append(Spacer(1, 3))
-
-        mb_content = []
-        if memberships:
-            mb_content.append(Paragraph("MEMBERSHIPS & ACCREDITATIONS", styles["inc_title"]))
-            mb_content.append(Spacer(1, 4))
-            for m in memberships:
-                mb_content.append(Paragraph(f"&#x2713;  {m}", styles["award_item"]))
-                mb_content.append(Spacer(1, 3))
-
-        if aw_content and mb_content:
-            aw_table = Table([[aw_content, mb_content]],
-                colWidths=[INNER_W*0.5, INNER_W*0.5])
-        elif aw_content:
-            aw_table = Table([[aw_content]], colWidths=[INNER_W])
-        else:
-            aw_table = Table([[mb_content]], colWidths=[INNER_W])
-
-        aw_table.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), CREAM),
-            ("LEFTPADDING", (0,0), (-1,-1), 14),
-            ("RIGHTPADDING", (0,0), (-1,-1), 14),
-            ("TOPPADDING", (0,0), (-1,-1), 12),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 12),
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("LINEBEFORE", (1,0), (1,-1), 0.5, BORDER) if (aw_content and mb_content) else ("LINEABOVE", (0,0), (-1,-1), 0, WHITE),
-            ("LINEBELOW", (0,-1), (-1,-1), 1, GOLD),
-        ]))
-        story.append(aw_table)
-        story.append(Spacer(1, 4*mm))
-
-    # Client Reviews
+    # ── 3 Client reviews ──────────────────────────────────────────────────────
     if reviews:
-        story.append(section_divider(styles, "WHAT OUR CLIENTS SAY"))
-        story.append(Spacer(1, 3*mm))
+        story.append(Paragraph('WHAT OUR CLIENTS SAY', S['section']))
+        story.append(hr(color=GOLD, thickness=0.5))
+        story.append(Spacer(1, 3 * mm))
 
-        review_cells = []
-        for rev in reviews[:3]:  # max 3 reviews
-            rating_stars = stars(rev.get("rating", 5))
-            cell_content = [
-                Paragraph(rating_stars, ParagraphStyle("stars",
-                    fontSize=12, fontName="Helvetica",
-                    textColor=GOLD, leading=16)),
-                Spacer(1, 4),
-                Paragraph(f'"{rev.get("review_text","")}"', styles["review_text"]),
-                Spacer(1, 6),
-                Paragraph(f'— {rev.get("reviewer_name","")}',
-                    styles["reviewer"]),
-                Paragraph(f'{rev.get("reviewer_nationality","")} · {rev.get("trip_destination","")}',
-                    styles["body_small"]),
+        review_list = list(reviews[:3])
+        while len(review_list) < 3:
+            review_list.append({})
+
+        cells = []
+        for rev in review_list:
+            text   = safe(rev.get('review_text'), '')
+            author = safe(rev.get('client_name'), '')
+            origin = safe(rev.get('client_origin'), '')
+            trip   = safe(rev.get('trip_summary'), '')
+
+            cell = [
+                Paragraph('★★★★★', ParagraphStyle('stars',
+                    fontName='Helvetica', fontSize=11,
+                    textColor=GOLD_STAR, leading=14)),
+                Spacer(1, 2 * mm),
+                Paragraph(f'"{text}"', S['review_body']),
+                Spacer(1, 3 * mm),
+                Paragraph(f"— {author}", S['review_author']),
+                Paragraph(f"{origin}  ·  {trip}", S['review_origin']),
             ]
-            review_cells.append(cell_content)
+            cells.append(cell)
 
-        if len(review_cells) == 3:
-            rev_table = Table([review_cells],
-                colWidths=[INNER_W/3]*3)
-        elif len(review_cells) == 2:
-            rev_table = Table([review_cells],
-                colWidths=[INNER_W/2]*2)
-        else:
-            rev_table = Table([review_cells], colWidths=[INNER_W])
-
-        rev_table.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), WHITE),
-            ("LEFTPADDING", (0,0), (-1,-1), 12),
-            ("RIGHTPADDING", (0,0), (-1,-1), 12),
-            ("TOPPADDING", (0,0), (-1,-1), 14),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 14),
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("LINEBEFORE", (1,0), (1,-1), 0.5, BORDER),
-            ("LINEBEFORE", (2,0), (2,-1), 0.5, BORDER) if len(review_cells) == 3 else ("LINEABOVE", (0,0), (-1,-1), 0, WHITE),
-            ("LINEABOVE", (0,0), (-1,0), 0.5, BORDER),
-            ("LINEBELOW", (0,-1), (-1,-1), 1, GOLD),
+        col_w_r = (CW - 4*mm) / 3
+        rev_t = Table([cells],
+                      colWidths=[col_w_r, col_w_r, col_w_r])
+        rev_t.setStyle(TableStyle([
+            ('VALIGN',        (0,0), (-1,-1), 'TOP'),
+            ('BACKGROUND',    (0,0), (-1,-1), REVIEW_BG),
+            ('BOX',           (0,0), (0,-1),  0.3, RULE_CLR),
+            ('BOX',           (1,0), (1,-1),  0.3, RULE_CLR),
+            ('BOX',           (2,0), (2,-1),  0.3, RULE_CLR),
+            ('TOPPADDING',    (0,0), (-1,-1), 8),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+            ('LEFTPADDING',   (0,0), (-1,-1), 8),
+            ('RIGHTPADDING',  (0,0), (-1,-1), 8),
         ]))
-        story.append(rev_table)
-        story.append(Spacer(1, 4*mm))
+        story.append(rev_t)
+        story.append(Spacer(1, 5 * mm))
 
-    # Contact & Social
-    story.append(section_divider(styles, "GET IN TOUCH"))
-    story.append(Spacer(1, 3*mm))
+    # ── Get in touch ──────────────────────────────────────────────────────────
+    story.append(Paragraph('GET IN TOUCH', S['section']))
+    story.append(hr(color=GOLD, thickness=0.5))
+    story.append(Spacer(1, 2 * mm))
 
     contact_items = []
-    if ag_email:
-        contact_items.append(f"&#x2709;  {ag_email}")
-    if profile.get("whatsapp"):
-        contact_items.append(f"&#x1F4F1;  {profile.get('whatsapp')}")
-    if profile.get("website_url"):
-        contact_items.append(f"&#x1F310;  {profile.get('website_url')}")
-    if profile.get("office_location"):
-        contact_items.append(f"&#x1F4CD;  {profile.get('office_location')}")
+    if email    != '—': contact_items.append(f"✉  {email}")
+    if phone    != '—': contact_items.append(f"☏  {phone}")
+    if website  != '—': contact_items.append(f"🌐  {website}")
+    if address  != '—': contact_items.append(f"📍  {address}")
+    if facebook != '—': contact_items.append(f"Facebook: {facebook}")
+    if instagram!= '—': contact_items.append(f"Instagram: {instagram}")
+    if linkedin != '—': contact_items.append(f"LinkedIn: {linkedin}")
 
-    social_items = []
-    socials = [
-        ("Facebook", profile.get("facebook_url","")),
-        ("Instagram", profile.get("instagram_url","")),
-        ("LinkedIn", profile.get("linkedin_url","")),
-        ("TikTok", profile.get("tiktok_url","")),
-        ("TripAdvisor", profile.get("tripadvisor_url","")),
-    ]
-    for name, url in socials:
-        if url:
-            social_items.append(f"{name}: {url}")
+    mid    = (len(contact_items) + 1) // 2
+    left_c = [Paragraph(i, S['contact']) for i in contact_items[:mid]]
+    right_c= [Paragraph(i, S['contact']) for i in contact_items[mid:]]
 
-    contact_left = [Paragraph(c, styles["body"]) for c in contact_items]
-    contact_right = [Paragraph(s, styles["social"]) for s in social_items]
-
-    if contact_left or contact_right:
-        contact_table = Table([[contact_left, contact_right]],
-            colWidths=[INNER_W*0.5, INNER_W*0.5])
-        contact_table.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), NAVY),
-            ("LEFTPADDING", (0,0), (-1,-1), 16),
-            ("RIGHTPADDING", (0,0), (-1,-1), 16),
-            ("TOPPADDING", (0,0), (-1,-1), 14),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 14),
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("LINEBEFORE", (1,0), (1,-1), 0.5, colors.HexColor("#2A4A6A")),
-        ]))
-        story.append(contact_table)
-
-    doc.build(story)
-    buffer.seek(0)
-    return buffer
+    ct = Table([[left_c, right_c]],
+               colWidths=[(CW - 6*mm)/2, (CW - 6*mm)/2])
+    ct.setStyle(TableStyle([
+        ('VALIGN',       (0,0), (-1,-1), 'TOP'),
+        ('LEFTPADDING',  (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('TOPPADDING',   (0,0), (-1,-1), 0),
+    ]))
+    story.append(ct)
 
 
-# ══════════════════════════════════════════════════════════════════
-# RECEIPT PDF
-# ══════════════════════════════════════════════════════════════════
+# ─── Running header/footer ────────────────────────────────────────────────────
+def make_page_template(agency, email, date):
+    def on_page(canvas, doc):
+        canvas.saveState()
 
-def generate_receipt_pdf(data):
-    buffer   = io.BytesIO()
-    styles   = S()
-    agency   = data.get("agency_name", "SafariFlow")
-    ag_email = data.get("agent_email", "")
-    symbol   = data.get("currency_symbol", "$")
+        # Subpage header (pages 2+)
+        if doc.page > 1:
+            canvas.setFillColor(NAVY)
+            canvas.rect(ML, PAGE_H - MT - 9*mm, CW, 9*mm, fill=1, stroke=0)
+            canvas.setFillColor(GOLD)
+            canvas.rect(ML, PAGE_H - MT - 9*mm, CW, 1.5, fill=1, stroke=0)
 
-    doc = BaseDocTemplate(
-        buffer, pagesize=A4,
-        leftMargin=MARGIN, rightMargin=MARGIN,
-        topMargin=26*mm, bottomMargin=20*mm,
+            canvas.setFillColor(white)
+            canvas.setFont('Helvetica-Bold', 7.5)
+            canvas.drawString(ML + 4*mm, PAGE_H - MT - 5.5*mm,
+                              agency.upper())
+
+            canvas.setFillColor(NAVY_MUTED)
+            canvas.setFont('Helvetica', 7)
+            canvas.drawCentredString(PAGE_W / 2, PAGE_H - MT - 5.5*mm,
+                f"{agency}  ·  {email}  ·  Prepared {date}")
+
+            canvas.setFillColor(GOLD)
+            canvas.setFont('Helvetica-Bold', 7.5)
+            canvas.drawRightString(PAGE_W - MR - 4*mm,
+                                   PAGE_H - MT - 5.5*mm, 'SAFARI QUOTE')
+
+        # Footer
+        canvas.setStrokeColor(RULE_CLR)
+        canvas.setLineWidth(0.3)
+        canvas.line(ML, MB - 4*mm, PAGE_W - MR, MB - 4*mm)
+
+        canvas.setFont('Helvetica', 7)
+        canvas.setFillColor(MUTED)
+        canvas.drawCentredString(PAGE_W / 2, MB - 8*mm,
+            f"{agency}  ·  {email}  ·  Page {doc.page}")
+
+        canvas.restoreState()
+    return on_page
+
+
+# ─── Main entry point ─────────────────────────────────────────────────────────
+def generate_quote_pdf(data: dict, output_path: str):
+    S      = make_styles()
+    agent  = data.get('agent', {})
+    agency = safe(agent.get('agency'), 'SafariFlow')
+    email  = safe(agent.get('email'), '')
+    date   = safe(data.get('generated_at'), '')
+
+    doc = SimpleDocTemplate(
+        output_path,
+        pagesize=A4,
+        leftMargin=ML, rightMargin=MR,
+        topMargin=MT, bottomMargin=MB,
+        title=f"Safari Quote — {safe(data.get('client', {}).get('name', ''))}",
+        author=agency,
     )
-    frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="main")
-    template = PageTemplate(
-        id="main", frames=[frame],
-        onPage=lambda c, d: draw_page(c, d, agency, ag_email, "PAYMENT RECEIPT")
-    )
-    doc.addPageTemplates([template])
+
     story = []
+    build_page1(data, S, story)
+    build_overview(data, S, story)
+    build_itinerary(data, S, story)
+    build_pricing(data, S, story)
+    build_inclusions_terms(data, S, story)
+    build_trust_page(data, S, story)
 
-    # Receipt header
-    rcpt_hdr = Table([[
-        Table([
-            [Paragraph("PAYMENT RECEIPT", styles["label"])],
-            [Paragraph(data.get("receipt_number", "—"), styles["value_gold"])],
-            [Spacer(1, 6)],
-            [Paragraph("BOOKING REFERENCE", styles["label"])],
-            [Paragraph(data.get("booking_number", "—"), styles["value"])],
-        ], colWidths=[INNER_W*0.6]),
-        Table([
-            [Paragraph("RECEIPT DATE", styles["label"])],
-            [Paragraph(data.get("receipt_date", datetime.now().strftime("%d %B %Y")), styles["value"])],
-            [Spacer(1, 6)],
-            [Paragraph("STATUS", styles["label"])],
-            [Paragraph("PAID", ParagraphStyle("paid",
-                fontSize=12, fontName="Helvetica-Bold",
-                textColor=GREEN, leading=16))],
-        ], colWidths=[INNER_W*0.35]),
-    ]], colWidths=[INNER_W*0.65, INNER_W*0.35])
-
-    rcpt_hdr.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), CREAM),
-        ("LEFTPADDING", (0,0), (-1,-1), 16),
-        ("RIGHTPADDING", (0,0), (-1,-1), 16),
-        ("TOPPADDING", (0,0), (-1,-1), 14),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 14),
-        ("VALIGN", (0,0), (-1,-1), "TOP"),
-        ("LINEBELOW", (0,0), (-1,-1), 2, GOLD),
-        ("LINEBEFORE", (1,0), (1,0), 1, BORDER),
-    ]))
-    story.append(rcpt_hdr)
-    story.append(Spacer(1, 5*mm))
-
-    # Client info
-    col_w = INNER_W / 4
-    meta = [
-        ("CLIENT NAME",    data.get("client_name", "—")),
-        ("CLIENT EMAIL",   data.get("client_email", "—")),
-        ("DESTINATION",    data.get("destination", "—")),
-        ("TRAVEL DATES",   data.get("travel_dates", "—")),
-    ]
-    meta_cells = [info_cell(l, v, styles, col_w) for l, v in meta]
-    meta_table = Table([meta_cells], colWidths=[col_w]*4)
-    meta_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), WHITE),
-        ("LINEBELOW", (0,0), (-1,-1), 0.8, GOLD),
-        ("LINEABOVE", (0,0), (-1,-1), 0.3, BORDER),
-        ("LINEBEFORE", (1,0), (1,0), 0.5, BORDER),
-        ("LINEBEFORE", (2,0), (2,0), 0.5, BORDER),
-        ("LINEBEFORE", (3,0), (3,0), 0.5, BORDER),
-        ("LEFTPADDING", (0,0), (-1,-1), 10),
-        ("TOPPADDING", (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-    ]))
-    story.append(meta_table)
-    story.append(Spacer(1, 6*mm))
-
-    # Amount paid banner
-    amount_paid = data.get("amount_paid_usd", 0)
-    paid_banner = Table([[
-        Paragraph("AMOUNT RECEIVED", styles["total_label"]),
-        Paragraph(fmt_currency(amount_paid, symbol), styles["receipt_amount"]),
-    ]], colWidths=[INNER_W*0.5, INNER_W*0.5])
-    paid_banner.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), NAVY),
-        ("LEFTPADDING", (0,0), (-1,-1), 16),
-        ("RIGHTPADDING", (0,0), (-1,-1), 16),
-        ("TOPPADDING", (0,0), (-1,-1), 16),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 16),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("LINEABOVE", (0,0), (-1,-1), 2, GOLD),
-        ("LINEBELOW", (0,0), (-1,-1), 2, GOLD),
-    ]))
-    story.append(paid_banner)
-    story.append(Spacer(1, 4*mm))
-
-    # Payment breakdown
-    total       = float(data.get("total_trip_cost_usd", 0))
-    paid        = float(data.get("amount_paid_usd", 0))
-    balance     = total - paid
-    due_date    = data.get("balance_due_date", "—")
-    payment_ref = data.get("payment_reference", "—")
-    method      = data.get("payment_method", "Bank Transfer")
-
-    breakdown_rows = [
-        [Paragraph("DESCRIPTION", styles["label"]),
-         Paragraph("AMOUNT", ParagraphStyle("al", fontSize=7,
-             fontName="Helvetica-Bold", textColor=TEXT_LIGHT,
-             leading=11, letterSpacing=1.2, alignment=TA_RIGHT))],
-        [Paragraph("Total Trip Cost", styles["body"]),
-         Paragraph(fmt_currency(total, symbol), styles["price"])],
-        [Paragraph(f"Amount Paid ({data.get('payment_type','Deposit')})", styles["body"]),
-         Paragraph(fmt_currency(paid, symbol),
-             ParagraphStyle("pp", fontSize=9.5, fontName="Helvetica-Bold",
-             textColor=GREEN, leading=13, alignment=TA_RIGHT))],
-        [Paragraph("Outstanding Balance", styles["body"]),
-         Paragraph(fmt_currency(balance, symbol), styles["price_bold"])],
-        [Paragraph(f"Balance Due Date: {due_date}", styles["body_mid"]),
-         Paragraph("", styles["price"])],
-    ]
-
-    bdown_table = Table(breakdown_rows,
-        colWidths=[INNER_W*0.7, INNER_W*0.3])
-    bdown_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), NAVY),
-        ("TEXTCOLOR", (0,0), (-1,0), GOLD),
-        ("LINEBELOW", (0,0), (-1,0), 1.5, GOLD),
-        ("LEFTPADDING", (0,0), (-1,-1), 12),
-        ("RIGHTPADDING", (0,0), (-1,-1), 12),
-        ("TOPPADDING", (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-        ("LINEBELOW", (0,1), (-1,-1), 0.3, BORDER),
-        ("BACKGROUND", (0,3), (-1,3), GOLD_BG),
-        ("BACKGROUND", (0,4), (-1,4), LIGHT_GREY),
-    ]))
-    story.append(bdown_table)
-    story.append(Spacer(1, 4*mm))
-
-    # Payment details
-    pay_detail_rows = [
-        ("PAYMENT METHOD", method),
-        ("PAYMENT REFERENCE", payment_ref),
-        ("RECEIVED BY", agency),
-        ("DATE RECEIVED", data.get("receipt_date", datetime.now().strftime("%d %B %Y"))),
-    ]
-    pd_cells = [info_cell(l, v, styles, INNER_W/4) for l, v in pay_detail_rows]
-    pd_table = Table([pd_cells], colWidths=[INNER_W/4]*4)
-    pd_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), CREAM),
-        ("LEFTPADDING", (0,0), (-1,-1), 10),
-        ("TOPPADDING", (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-        ("LINEBEFORE", (1,0),(1,-1), 0.5, BORDER),
-        ("LINEBEFORE", (2,0),(2,-1), 0.5, BORDER),
-        ("LINEBEFORE", (3,0),(3,-1), 0.5, BORDER),
-        ("LINEABOVE", (0,0),(-1,0), 0.5, BORDER),
-        ("LINEBELOW", (0,-1),(-1,-1), 1, GOLD),
-    ]))
-    story.append(pd_table)
-    story.append(Spacer(1, 6*mm))
-
-    # Reminder note
-    if balance > 0:
-        reminder = Table([[
-            Paragraph(
-                f"&#x26A0;  Please note: An outstanding balance of "
-                f"<b>{fmt_currency(balance, symbol)}</b> is due by "
-                f"<b>{due_date}</b>. Payment instructions will be sent separately.",
-                styles["note"])
-        ]], colWidths=[INNER_W])
-        reminder.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), GOLD_BG),
-            ("LEFTPADDING", (0,0), (-1,-1), 14),
-            ("RIGHTPADDING", (0,0), (-1,-1), 14),
-            ("TOPPADDING", (0,0), (-1,-1), 10),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 10),
-            ("LINEBEFORE", (0,0), (-1,-1), 3, GOLD),
-        ]))
-        story.append(reminder)
-        story.append(Spacer(1, 5*mm))
-
-    # Thank you footer
-    thanks = Table([[
-        Paragraph(f"Thank you for booking with {agency}!",
-            ParagraphStyle("ty", fontSize=12, fontName="Helvetica-Bold",
-            textColor=WHITE, leading=16, alignment=TA_CENTER)),
-        Paragraph("This is an official receipt. Please retain for your records.",
-            ParagraphStyle("tr", fontSize=8, fontName="Helvetica",
-            textColor=colors.HexColor("#AABBCC"), leading=12,
-            alignment=TA_CENTER)),
-    ]], colWidths=[INNER_W])
-    thanks.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), NAVY),
-        ("LEFTPADDING", (0,0), (-1,-1), 16),
-        ("RIGHTPADDING", (0,0), (-1,-1), 16),
-        ("TOPPADDING", (0,0), (-1,-1), 14),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 14),
-        ("LINEABOVE", (0,0), (-1,-1), 2, GOLD),
-    ]))
-    story.append(thanks)
-
-    doc.build(story)
-    buffer.seek(0)
-    return buffer
-
-
-# ══════════════════════════════════════════════════════════════════
-# ACCOMMODATION VOUCHER PDF
-# ══════════════════════════════════════════════════════════════════
-
-def generate_accommodation_voucher(data):
-    """
-    Generates accommodation voucher in one of two states:
- 
-    RESERVED (voucher_status = "reserved"):
-      - Agent contact shown — supplier contact hidden
-      - Provisional booking banner (amber)
-      - Rider: full confirmation ref provided on final payment
- 
-    CONFIRMED (voucher_status = "confirmed"):
-      - Supplier contact revealed
-      - Confirmed booking banner (green)
-      - Supplier confirmation reference shown
-      - Full check-in instructions
-    """
-    buffer   = io.BytesIO()
-    styles   = S()
-    agency   = data.get("agency_name", "SafariDesk")
-    ag_email = data.get("agent_email", "")
- 
-    # ── Determine voucher status ──────────────────────────────────
-    voucher_status = data.get("voucher_status", "reserved").lower()
-    is_confirmed   = voucher_status == "confirmed"
- 
-    doc = BaseDocTemplate(
-        buffer, pagesize=A4,
-        leftMargin=MARGIN, rightMargin=MARGIN,
-        topMargin=26*mm, bottomMargin=20*mm,
+    doc.build(
+        story,
+        onFirstPage=make_page_template(agency, email, date),
+        onLaterPages=make_page_template(agency, email, date),
     )
-    frame    = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="main")
-    template = PageTemplate(
-        id="main", frames=[frame],
-        onPage=lambda c, d: draw_page(c, d, agency, ag_email, "ACCOMMODATION VOUCHER")
-    )
-    doc.addPageTemplates([template])
-    story = []
- 
-    # ── Voucher Header ────────────────────────────────────────────
-    vchr_hdr = Table([[
-        Paragraph(
-            "&#x2705; ACCOMMODATION VOUCHER" if is_confirmed
-            else "&#x1F3E8; ACCOMMODATION VOUCHER",
-            ParagraphStyle("vh", fontSize=16, fontName="Helvetica-Bold",
-            textColor=WHITE, leading=22)
-        ),
-        Table([
-            [Paragraph("VOUCHER NUMBER", styles["label"])],
-            [Paragraph(data.get("voucher_number", "—"), styles["value_gold"])],
-        ], colWidths=[INNER_W * 0.35]),
-    ]], colWidths=[INNER_W * 0.65, INNER_W * 0.35])
-    vchr_hdr.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), NAVY),
-        ("LEFTPADDING", (0,0), (-1,-1), 16),
-        ("RIGHTPADDING", (0,0), (-1,-1), 16),
-        ("TOPPADDING", (0,0), (-1,-1), 16),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 16),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("LINEBELOW", (0,0), (-1,-1), 2, GOLD),
-        ("LINEBEFORE", (1,0), (1,0), 1, colors.HexColor("#2A4A6A")),
-    ]))
-    story.append(vchr_hdr)
-    story.append(Spacer(1, 4*mm))
- 
-    # ── Status Banner ─────────────────────────────────────────────
-    if is_confirmed:
-        status_bg   = GREEN_BG
-        status_border = GREEN
-        status_icon = "&#x2705;"
-        status_title = "CONFIRMED BOOKING"
-        status_text = (
-            f"This booking is fully confirmed. "
-            f"Supplier Confirmation Reference: "
-            f"<b>{data.get('confirmation_reference', '—')}</b>"
-        )
-        status_style = styles["confirmed_text"]
-    else:
-        status_bg     = AMBER_BG
-        status_border = AMBER
-        status_icon   = "&#x26A0;"
-        status_title  = "PROVISIONAL BOOKING"
-        status_text   = (
-            "This is a provisional reservation. Your full confirmation reference "
-            "will be provided upon receipt of final payment. For any queries "
-            "regarding this booking, please contact your travel specialist below."
-        )
-        status_style = styles["provisional_text"]
- 
-    status_banner = Table([[
-        Table([
-            [Paragraph(
-                f"{status_icon}  {status_title}",
-                ParagraphStyle("sb_title", fontSize=11, fontName="Helvetica-Bold",
-                    textColor=status_border, leading=16)
-            )],
-            [Spacer(1, 3)],
-            [Paragraph(status_text, status_style)],
-        ], colWidths=[INNER_W - 28])
-    ]], colWidths=[INNER_W])
-    status_banner.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), status_bg),
-        ("LEFTPADDING", (0,0), (-1,-1), 14),
-        ("RIGHTPADDING", (0,0), (-1,-1), 14),
-        ("TOPPADDING", (0,0), (-1,-1), 12),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 12),
-        ("LINEBEFORE", (0,0), (-1,-1), 4, status_border),
-        ("LINEBELOW", (0,-1), (-1,-1), 1, status_border),
-        ("LINEABOVE", (0,0), (-1,0), 1, status_border),
-    ]))
-    story.append(status_banner)
-    story.append(Spacer(1, 5*mm))
- 
-    # ── Property Details ──────────────────────────────────────────
-    story.append(section_divider(styles, "PROPERTY DETAILS"))
-    story.append(Spacer(1, 3*mm))
- 
-    prop_rows = [
-        ("PROPERTY NAME",    data.get("property_name", "—")),
-        ("DESTINATION",      data.get("destination", "—")),
-        ("COUNTRY",          data.get("country", "—")),
-        ("ROOM TYPE",        data.get("room_type", "—")),
-        ("MEAL PLAN",        data.get("meal_plan", "—")),
-        ("CHECK-IN DATE",    data.get("check_in_date", "—")),
-        ("CHECK-OUT DATE",   data.get("check_out_date", "—")),
-        ("NUMBER OF NIGHTS", str(data.get("nights", "—"))),
-    ]
- 
-    for i in range(0, len(prop_rows), 4):
-        chunk = prop_rows[i:i+4]
-        cells = [info_cell(l, v, styles, INNER_W/4) for l, v in chunk]
-        # Pad to 4 cells if needed
-        while len(cells) < 4:
-            cells.append(Table([[Paragraph("", styles["label"])]], colWidths=[INNER_W/4]))
-        t = Table([cells], colWidths=[INNER_W/4]*4)
-        t.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), CREAM),
-            ("LEFTPADDING", (0,0), (-1,-1), 10),
-            ("TOPPADDING", (0,0), (-1,-1), 8),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-            ("LINEBEFORE", (1,0),(1,-1), 0.5, BORDER),
-            ("LINEBEFORE", (2,0),(2,-1), 0.5, BORDER),
-            ("LINEBEFORE", (3,0),(3,-1), 0.5, BORDER),
-            ("LINEBELOW", (0,-1),(-1,-1), 0.5, BORDER),
-        ]))
-        story.append(t)
-    story.append(Spacer(1, 4*mm))
- 
-    # ── Guest Names ────────────────────────────────────
-    guests = data.get("guest_names", [])
-    if guests:
-        story.append(section_divider(styles, "GUESTS"))
-        story.append(Spacer(1, 3*mm))
-        guest_rows = [[
-            Paragraph(str(i+1), styles["label"]),
-            Paragraph(g, styles["body"]),
-        ] for i, g in enumerate(guests)]
-        guest_table = Table(guest_rows, colWidths=[INNER_W*0.1, INNER_W*0.9])
-        guest_table.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), WHITE),
-            ("LEFTPADDING", (0,0), (-1,-1), 12),
-            ("TOPPADDING", (0,0), (-1,-1), 6),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 6),
-            ("LINEBELOW", (0,0), (-1,-1), 0.3, BORDER),
-            ("LINEABOVE", (0,0), (-1,0), 0.5, BORDER),
-        ]))
-        story.append(guest_table)
-        story.append(Spacer(1, 4*mm))
- 
-    # ── Contact Section ──────────────────────────────────
-    # RESERVED → show agent contact
-    # CONFIRMED → show supplier contact
-    sup_col = INNER_W / 3
- 
-    if is_confirmed:
-        story.append(section_divider(styles, "PROPERTY CONTACT"))
-        story.append(Spacer(1, 3*mm))
-        sup_cells = [
-            info_cell("PROPERTY EMAIL",   data.get("supplier_email", "—"), styles, sup_col),
-            info_cell("PROPERTY PHONE",   data.get("supplier_phone", "—"), styles, sup_col),
-            info_cell("CONFIRMATION REF", data.get("confirmation_reference", "—"), styles, sup_col),
-        ]
-        contact_note = "Present this voucher at check-in. Quote your confirmation reference."
-    else:
-        story.append(section_divider(styles, "YOUR TRAVEL SPECIALIST"))
-        story.append(Spacer(1, 3*mm))
-        sup_cells = [
-            info_cell("CONTACT NAME",  data.get("agency_name", "—"), styles, sup_col),
-            info_cell("CONTACT EMAIL", data.get("agent_email", "—"), styles, sup_col),
-            info_cell("CONTACT PHONE", data.get("agent_phone", "—"), styles, sup_col),
-        ]
-        contact_note = (
-            "For all pre-arrival queries, please contact your travel specialist above. "
-            "Direct property contact details will be provided upon full payment confirmation."
-        )
- 
-    sup_table = Table([sup_cells], colWidths=[sup_col]*3)
-    sup_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), CREAM),
-        ("LEFTPADDING", (0,0), (-1,-1), 10),
-        ("TOPPADDING", (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-        ("LINEBEFORE", (1,0),(1,-1), 0.5, BORDER),
-        ("LINEBEFORE", (2,0),(2,-1), 0.5, BORDER),
-        ("LINEBELOW", (0,-1),(-1,-1), 1, GOLD),
-    ]))
-    story.append(sup_table)
-    story.append(Spacer(1, 3*mm))
- 
-    # Contact instruction note
-    contact_note_table = Table(
-        [[Paragraph(contact_note, styles["note"])]],
-        colWidths=[INNER_W]
-    )
-    contact_note_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), GOLD_BG),
-        ("LEFTPADDING", (0,0), (-1,-1), 14),
-        ("RIGHTPADDING", (0,0), (-1,-1), 14),
-        ("TOPPADDING", (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-        ("LINEBEFORE", (0,0), (-1,-1), 3, GOLD),
-    ]))
-    story.append(contact_note_table)
-    story.append(Spacer(1, 4*mm))
- 
-    # ── Booking Ref + Special Notes ──────────────────────────
-    booking_ref = data.get("booking_number", "")
-    special_notes = data.get("special_notes", "")
- 
-    ref_cells = [
-        info_cell("BOOKING REFERENCE", booking_ref or "—", styles, INNER_W/2),
-        info_cell("ISSUED BY", agency, styles, INNER_W/2),
-    ]
-    ref_table = Table([ref_cells], colWidths=[INNER_W/2]*2)
-    ref_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), WHITE),
-        ("LEFTPADDING", (0,0), (-1,-1), 10),
-        ("TOPPADDING", (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-        ("LINEBEFORE", (1,0),(1,-1), 0.5, BORDER),
-        ("LINEBELOW", (0,-1),(-1,-1), 0.5, BORDER),
-    ]))
-    story.append(ref_table)
- 
-    if special_notes:
-        story.append(Spacer(1, 4*mm))
-        notes_t = Table([[Paragraph(special_notes, styles["note"])]], colWidths=[INNER_W])
-        notes_t.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), GOLD_BG),
-            ("LEFTPADDING", (0,0), (-1,-1), 14),
-            ("RIGHTPADDING", (0,0), (-1,-1), 14),
-            ("TOPPADDING", (0,0), (-1,-1), 10),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 10),
-            ("LINEBEFORE", (0,0), (-1,-1), 3, GOLD),
-        ]))
-        story.append(notes_t)
- 
-    story.append(Spacer(1, 4*mm))
- 
-    # ── Footer ────────────────────────────────────────────────────
-    footer_text = (
-        "This voucher is valid for the dates specified above. Present this voucher at check-in."
-        if is_confirmed else
-        "This is a provisional voucher. Final confirmation details will follow upon full payment."
-    )
-    agent_footer = Table([[
-        Paragraph(
-            f"Issued by: {agency}  ·  {ag_email}",
-            ParagraphStyle("af", fontSize=9, fontName="Helvetica-Bold",
-            textColor=WHITE, leading=13, alignment=TA_CENTER)
-        ),
-        Paragraph(
-            footer_text,
-            ParagraphStyle("av", fontSize=8, fontName="Helvetica",
-            textColor=colors.HexColor("#AABBCC"), leading=12, alignment=TA_CENTER)
-        ),
-    ]], colWidths=[INNER_W])
-    agent_footer.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), NAVY),
-        ("LEFTPADDING", (0,0), (-1,-1), 16),
-        ("RIGHTPADDING", (0,0), (-1,-1), 16),
-        ("TOPPADDING", (0,0), (-1,-1), 12),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 12),
-        ("LINEABOVE", (0,0), (-1,-1), 2, GOLD),
-    ]))
-    story.append(agent_footer)
- 
-    doc.build(story)
-    buffer.seek(0)
-    return buffer
-
-# ══════════════════════════════════════════════════════════════════
-# TRANSPORT VOUCHER PDF
-# ══════════════════════════════════════════════════════════════════
-
-def generate_transport_voucher(data):
-    """
-    Generates transport voucher in one of two states:
- 
-    RESERVED (voucher_status = "reserved"):
-      - Agent contact shown — operator contact hidden
-      - Provisional booking banner (amber)
-      - Rider: full confirmation ref provided on final payment
- 
-    CONFIRMED (voucher_status = "confirmed"):
-      - Operator contact revealed
-      - Confirmed booking banner (green)
-      - Operator confirmation reference shown
-      - Luggage and boarding instructions
-    """
-    buffer   = io.BytesIO()
-    styles   = S()
-    agency   = data.get("agency_name", "SafariDesk")
-    ag_email = data.get("agent_email", "")
- 
-    # ── Determine voucher status ──────────────────────────────────
-    voucher_status = data.get("voucher_status", "reserved").lower()
-    is_confirmed   = voucher_status == "confirmed"
- 
-    transport_type = data.get("transport_type", "transfer").upper()
-    icon = (
-        "&#x2708;" if data.get("transport_type") == "fly"
-        else "&#x1F6A2;" if data.get("transport_type") == "boat"
-        else "&#x1F697;"
-    )
- 
-    doc = BaseDocTemplate(
-        buffer, pagesize=A4,
-        leftMargin=MARGIN, rightMargin=MARGIN,
-        topMargin=26*mm, bottomMargin=20*mm,
-    )
-    frame    = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="main")
-    template = PageTemplate(
-        id="main", frames=[frame],
-        onPage=lambda c, d: draw_page(c, d, agency, ag_email, "TRANSPORT VOUCHER")
-    )
-    doc.addPageTemplates([template])
-    story = []
- 
-    # ── Voucher Header ────────────────────────────────────────────
-    from_loc = data.get("from_location", "—")
-    to_loc   = data.get("to_location", "—")
- 
-    vchr_hdr = Table([[
-        Table([
-            [Paragraph(
-                f"{icon} TRANSPORT VOUCHER — {transport_type}",
-                ParagraphStyle("th", fontSize=16, fontName="Helvetica-Bold",
-                textColor=WHITE, leading=22)
-            )],
-            [Paragraph(
-                f"{from_loc}  &#x27A1;  {to_loc}",
-                ParagraphStyle("tr", fontSize=10, fontName="Helvetica",
-                textColor=GOLD, leading=14)
-            )],
-        ], colWidths=[INNER_W * 0.62]),
-        Table([
-            [Paragraph("VOUCHER NUMBER", styles["label"])],
-            [Paragraph(data.get("voucher_number", "—"), styles["value_gold"])],
-        ], colWidths=[INNER_W * 0.35]),
-    ]], colWidths=[INNER_W * 0.65, INNER_W * 0.35])
-    vchr_hdr.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), NAVY),
-        ("LEFTPADDING", (0,0), (-1,-1), 16),
-        ("RIGHTPADDING", (0,0), (-1,-1), 16),
-        ("TOPPADDING", (0,0), (-1,-1), 14),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 14),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("LINEBELOW", (0,0), (-1,-1), 2, GOLD),
-        ("LINEBEFORE", (1,0), (1,0), 1, colors.HexColor("#2A4A6A")),
-    ]))
-    story.append(vchr_hdr)
-    story.append(Spacer(1, 4*mm))
- 
-    # ── Status Banner ─────────────────────────────────────────────
-    if is_confirmed:
-        status_bg     = GREEN_BG
-        status_border = GREEN
-        status_icon   = "&#x2705;"
-        status_title  = "CONFIRMED BOOKING"
-        status_text   = (
-            f"This transfer is fully confirmed. "
-            f"Operator Confirmation Reference: "
-            f"<b>{data.get('confirmation_reference', '—')}</b>"
-        )
-        status_style = styles["confirmed_text"]
-    else:
-        status_bg     = AMBER_BG
-        status_border = AMBER
-        status_icon   = "&#x26A0;"
-        status_title  = "PROVISIONAL BOOKING"
-        status_text   = (
-            "This is a provisional transfer reservation. Your full confirmation reference "
-            "and operator contact details will be provided upon receipt of final payment. "
-            "For any queries, please contact your travel specialist below."
-        )
-        status_style = styles["provisional_text"]
- 
-    status_banner = Table([[
-        Table([
-            [Paragraph(
-                f"{status_icon}  {status_title}",
-                ParagraphStyle("sb_title", fontSize=11, fontName="Helvetica-Bold",
-                    textColor=status_border, leading=16)
-            )],
-            [Spacer(1, 3)],
-            [Paragraph(status_text, status_style)],
-        ], colWidths=[INNER_W - 28])
-    ]], colWidths=[INNER_W])
-    status_banner.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), status_bg),
-        ("LEFTPADDING", (0,0), (-1,-1), 14),
-        ("RIGHTPADDING", (0,0), (-1,-1), 14),
-        ("TOPPADDING", (0,0), (-1,-1), 12),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 12),
-        ("LINEBEFORE", (0,0), (-1,-1), 4, status_border),
-        ("LINEBELOW", (0,-1), (-1,-1), 1, status_border),
-        ("LINEABOVE", (0,0), (-1,0), 1, status_border),
-    ]))
-    story.append(status_banner)
-    story.append(Spacer(1, 5*mm))
- 
-    # ── Transfer Details ──────────────────────────────────────────
-    story.append(section_divider(styles, "TRANSFER DETAILS"))
-    story.append(Spacer(1, 3*mm))
- 
-    op_col = INNER_W / 3
-    op_row1 = [
-        info_cell("OPERATOR",      data.get("operator_name", "—"), styles, op_col),
-        info_cell("VEHICLE TYPE",  data.get("vehicle_type", "—"),  styles, op_col),
-        info_cell("PICKUP DATE",   data.get("pickup_date", "—"),   styles, op_col),
-    ]
-    op_row2 = [
-        info_cell("PICKUP TIME",   data.get("pickup_time", "—"),   styles, op_col),
-        info_cell("PICKUP POINT",  data.get("pickup_point", "—"),  styles, op_col),
-        info_cell("DROP-OFF POINT",data.get("dropoff_point", "—"), styles, op_col),
-    ]
-    op_row3 = [
-        info_cell("DURATION",      data.get("duration", "—"),      styles, op_col),
-        info_cell("BOOKING REF",   data.get("booking_number", "—"),styles, op_col),
-        info_cell("PASSENGERS",    str(data.get("pax", "—")),      styles, op_col),
-    ]
- 
-    for row in [op_row1, op_row2, op_row3]:
-        t = Table([row], colWidths=[op_col]*3)
-        t.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), CREAM),
-            ("LEFTPADDING", (0,0), (-1,-1), 10),
-            ("TOPPADDING", (0,0), (-1,-1), 8),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-            ("LINEBEFORE", (1,0),(1,-1), 0.5, BORDER),
-            ("LINEBEFORE", (2,0),(2,-1), 0.5, BORDER),
-            ("LINEBELOW", (0,-1),(-1,-1), 0.5, BORDER),
-        ]))
-        story.append(t)
-    story.append(Spacer(1, 4*mm))
- 
-    # ── Passengers ────────────────────────────────────────────────
-    guests = data.get("guest_names", [])
-    if guests:
-        story.append(section_divider(styles, "PASSENGERS"))
-        story.append(Spacer(1, 3*mm))
-        guest_rows = [[
-            Paragraph(str(i+1), styles["label"]),
-            Paragraph(g, styles["body"]),
-        ] for i, g in enumerate(guests)]
-        guest_table = Table(guest_rows, colWidths=[INNER_W*0.1, INNER_W*0.9])
-        guest_table.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), WHITE),
-            ("LEFTPADDING", (0,0), (-1,-1), 12),
-            ("TOPPADDING", (0,0), (-1,-1), 6),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 6),
-            ("LINEBELOW", (0,0), (-1,-1), 0.3, BORDER),
-            ("LINEABOVE", (0,0), (-1,0), 0.5, BORDER),
-        ]))
-        story.append(guest_table)
-        story.append(Spacer(1, 4*mm))
- 
-    # ── Operator Contact ──────────────────────────────────────────
-    # RESERVED → show agent contact
-    # CONFIRMED → show operator contact
-    if is_confirmed:
-        story.append(section_divider(styles, "OPERATOR CONTACT"))
-        story.append(Spacer(1, 3*mm))
-        op_cells = [
-            info_cell("OPERATOR EMAIL",   data.get("operator_email", "—"), styles, op_col),
-            info_cell("OPERATOR PHONE",   data.get("operator_phone", "—"), styles, op_col),
-            info_cell("CONFIRMATION REF", data.get("confirmation_reference", "—"), styles, op_col),
-        ]
-        contact_note = (
-            "Present this voucher to your driver or pilot at the time of transfer. "
-            "Quote your confirmation reference when checking in."
-        )
-    else:
-        story.append(section_divider(styles, "YOUR TRAVEL SPECIALIST"))
-        story.append(Spacer(1, 3*mm))
-        op_cells = [
-            info_cell("CONTACT NAME",  data.get("agency_name", "—"),  styles, op_col),
-            info_cell("CONTACT EMAIL", data.get("agent_email", "—"),  styles, op_col),
-            info_cell("CONTACT PHONE", data.get("agent_phone", "—"),  styles, op_col),
-        ]
-        contact_note = (
-            "For all pre-transfer queries, please contact your travel specialist above. "
-            "Operator contact details and confirmation reference will be provided upon full payment."
-        )
- 
-    op_table = Table([op_cells], colWidths=[op_col]*3)
-    op_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), CREAM),
-        ("LEFTPADDING", (0,0), (-1,-1), 10),
-        ("TOPPADDING", (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-        ("LINEBEFORE", (1,0),(1,-1), 0.5, BORDER),
-        ("LINEBEFORE", (2,0),(2,-1), 0.5, BORDER),
-        ("LINEBELOW", (0,-1),(-1,-1), 1, GOLD),
-    ]))
-    story.append(op_table)
-    story.append(Spacer(1, 3*mm))
- 
-    # Contact instruction note
-    contact_note_table = Table(
-        [[Paragraph(contact_note, styles["note"])]],
-        colWidths=[INNER_W]
-    )
-    contact_note_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), GOLD_BG),
-        ("LEFTPADDING", (0,0), (-1,-1), 14),
-        ("RIGHTPADDING", (0,0), (-1,-1), 14),
-        ("TOPPADDING", (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
-        ("LINEBEFORE", (0,0), (-1,-1), 3, GOLD),
-    ]))
-    story.append(contact_note_table)
- 
-    # ── Special Notes ─────────────────────────────────────────────
-    special_notes = data.get("special_notes", "")
-    if special_notes:
-        story.append(Spacer(1, 4*mm))
-        notes_t = Table([[Paragraph(special_notes, styles["note"])]], colWidths=[INNER_W])
-        notes_t.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), GOLD_BG),
-            ("LEFTPADDING", (0,0), (-1,-1), 14),
-            ("RIGHTPADDING", (0,0), (-1,-1), 14),
-            ("TOPPADDING", (0,0), (-1,-1), 10),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 10),
-            ("LINEBEFORE", (0,0), (-1,-1), 3, GOLD),
-        ]))
-        story.append(notes_t)
- 
-    story.append(Spacer(1, 4*mm))
- 
-    # ── Footer ────────────────────────────────────────────────────
-    footer_text = (
-        "Present this voucher to your driver/pilot at the time of transfer."
-        if is_confirmed else
-        "This is a provisional voucher. Operator details will follow upon full payment."
-    )
-    agent_footer = Table([[
-        Paragraph(
-            f"Issued by: {agency}  ·  {ag_email}",
-            ParagraphStyle("af2", fontSize=9, fontName="Helvetica-Bold",
-            textColor=WHITE, leading=13, alignment=TA_CENTER)
-        ),
-        Paragraph(
-            footer_text,
-            ParagraphStyle("av2", fontSize=8, fontName="Helvetica",
-            textColor=colors.HexColor("#AABBCC"), leading=12, alignment=TA_CENTER)
-        ),
-    ]], colWidths=[INNER_W])
-    agent_footer.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), NAVY),
-        ("LEFTPADDING", (0,0), (-1,-1), 16),
-        ("RIGHTPADDING", (0,0), (-1,-1), 16),
-        ("TOPPADDING", (0,0), (-1,-1), 12),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 12),
-        ("LINEABOVE", (0,0), (-1,-1), 2, GOLD),
-    ]))
-    story.append(agent_footer)
- 
-    doc.build(story)
-    buffer.seek(0)
-    return buffer
