@@ -3,6 +3,8 @@ import json
 import uuid
 import base64
 import logging
+import urllib.request
+import urllib.error
 from flask import Flask, request, jsonify
 from pdf_generator import generate_quote_pdf
 
@@ -13,6 +15,49 @@ app = Flask(__name__)
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'outputs')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+SUPABASE_URL     = os.environ.get('SUPABASE_URL', '')
+SUPABASE_KEY     = os.environ.get('SUPABASE_SERVICE_KEY', '')
+STORAGE_BUCKET   = 'quote-pdfs'
+
+
+def upload_to_supabase(file_path: str, filename: str) -> str:
+    """
+    Upload PDF to Supabase Storage.
+    Returns the public URL of the uploaded file.
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.warning("Supabase credentials not set — skipping upload")
+        return ''
+
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{filename}"
+
+    with open(file_path, 'rb') as f:
+        pdf_bytes = f.read()
+
+    req = urllib.request.Request(
+        upload_url,
+        data=pdf_bytes,
+        method='POST',
+        headers={
+            'Authorization':  f'Bearer {SUPABASE_KEY}',
+            'Content-Type':   'application/pdf',
+            'x-upsert':       'true',
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+        public_url = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{filename}"
+        logger.info(f"PDF uploaded to Supabase Storage: {public_url}")
+        return public_url
+    except urllib.error.HTTPError as e:
+        logger.error(f"Supabase upload failed: {e.code} {e.reason}")
+        return ''
+    except Exception as e:
+        logger.error(f"Supabase upload error: {str(e)}")
+        return ''
 
 
 @app.route('/health', methods=['GET'])
@@ -36,12 +81,16 @@ def generate_pdf():
         filename     = f"SafariFlow_Quote_{quote_number}.pdf"
         output_path  = os.path.join(OUTPUT_DIR, filename)
 
+        # Generate PDF
         generate_quote_pdf(data, output_path)
 
-        # Read and encode as base64 so Make.com can receive and store in Supabase
+        # Upload to Supabase Storage
+        pdf_url = upload_to_supabase(output_path, filename)
+
+        # Read and encode as base64 for email attachment
         with open(output_path, 'rb') as f:
-            pdf_bytes   = f.read()
-            pdf_base64  = base64.b64encode(pdf_bytes).decode('utf-8')
+            pdf_bytes  = f.read()
+            pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
 
         logger.info(f"PDF generated successfully: {filename} ({len(pdf_bytes)} bytes)")
 
@@ -50,6 +99,7 @@ def generate_pdf():
             'filename':     filename,
             'quote_number': quote_number,
             'pdf_base64':   pdf_base64,
+            'pdf_url':      pdf_url,
             'file_size':    len(pdf_bytes),
             'client_name':  data.get('client_name', ''),
             'agent_email':  data.get('agent_email', ''),
