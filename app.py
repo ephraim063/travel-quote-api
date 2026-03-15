@@ -1,8 +1,9 @@
 import os
 import json
 import uuid
+import base64
 import logging
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from pdf_generator import generate_quote_pdf
 
 logging.basicConfig(level=logging.INFO)
@@ -31,20 +32,29 @@ def generate_pdf():
         if missing:
             return jsonify({'error': f'Missing required fields: {missing}'}), 400
 
-        quote_id = data.get('quote_id') or str(uuid.uuid4())[:8].upper()
-        filename = f"SafariFlow_Quote_{quote_id}.pdf"
-        output_path = os.path.join(OUTPUT_DIR, filename)
+        quote_number = data.get('quote_number', str(uuid.uuid4())[:8].upper())
+        filename     = f"SafariFlow_Quote_{quote_number}.pdf"
+        output_path  = os.path.join(OUTPUT_DIR, filename)
 
         generate_quote_pdf(data, output_path)
 
-        logger.info(f"PDF generated successfully: {filename}")
+        # Read and encode as base64 so Make.com can receive and store in Supabase
+        with open(output_path, 'rb') as f:
+            pdf_bytes   = f.read()
+            pdf_base64  = base64.b64encode(pdf_bytes).decode('utf-8')
 
-        return send_file(
-            output_path,
-            mimetype='application/pdf',
-            as_attachment=True,
-            download_name=filename
-        )
+        logger.info(f"PDF generated successfully: {filename} ({len(pdf_bytes)} bytes)")
+
+        return jsonify({
+            'success':      True,
+            'filename':     filename,
+            'quote_number': quote_number,
+            'pdf_base64':   pdf_base64,
+            'file_size':    len(pdf_bytes),
+            'client_name':  data.get('client_name', ''),
+            'agent_email':  data.get('agent_email', ''),
+            'quote_date':   data.get('quote_date', ''),
+        })
 
     except Exception as e:
         logger.error(f"PDF generation failed: {str(e)}", exc_info=True)
