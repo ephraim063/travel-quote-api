@@ -406,7 +406,7 @@ def reject():
     supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
         'status': 'revision_requested',        
     })
-
+logger.info(f"Supabase update result for {quote_id}: {result}")
     # Trigger Make.com Scenario 2
     trigger_make_webhook(MAKE_S2_WEBHOOK, {
         'event': 'quote_rejected',
