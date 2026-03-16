@@ -35,11 +35,11 @@ from reportlab.platypus.flowables import Flowable
 NAVY       = HexColor('#1B2A47')
 GOLD       = HexColor('#C4922A')
 GOLD_STAR  = HexColor('#E8C068')
-EARTH      = HexColor('#2C1810')
-SAGE       = HexColor('#4A5E3A')
+EARTH      = HexColor('#1A1A1A')   # darker — was #2C1810
+SAGE       = HexColor('#2D4A1E')   # darker green — was #4A5E3A
 SAND       = HexColor('#F5F0E8')
-CHARCOAL   = HexColor('#3D3D3D')
-MUTED      = HexColor('#7A7A7A')
+CHARCOAL   = HexColor('#1C1C1C')   # near black — was #3D3D3D
+MUTED      = HexColor('#444444')   # dark grey — was #7A7A7A
 RULE_CLR   = HexColor('#D4B896')
 TABLE_ALT  = HexColor('#FAF7F2')
 NAVY_MUTED = HexColor('#8A9AB8')
@@ -50,7 +50,7 @@ REVIEW_BG  = HexColor('#F9F6F0')
 PAGE_W, PAGE_H = A4
 ML = 18 * mm
 MR = 18 * mm
-MT = 14 * mm
+MT = 26 * mm   # increased from 14mm to clear the subpage header band
 MB = 22 * mm
 CW = PAGE_W - ML - MR
 
@@ -841,27 +841,29 @@ def make_page_template(agency, email, date):
     def on_page(canvas, doc):
         canvas.saveState()
 
-        # Subpage header (pages 2+)
+        # Subpage header (pages 2+) — sits in the top margin area
         if doc.page > 1:
+            band_h = 11 * mm
+            band_y = PAGE_H - band_h  # sits at very top of page
             canvas.setFillColor(NAVY)
-            canvas.rect(ML, PAGE_H - MT - 9*mm, CW, 9*mm, fill=1, stroke=0)
+            canvas.rect(0, band_y, PAGE_W, band_h, fill=1, stroke=0)
             canvas.setFillColor(GOLD)
-            canvas.rect(ML, PAGE_H - MT - 9*mm, CW, 1.5, fill=1, stroke=0)
+            canvas.rect(0, band_y, PAGE_W, 1.5, fill=1, stroke=0)
+
+            text_y = band_y + band_h * 0.38
 
             canvas.setFillColor(white)
             canvas.setFont('Helvetica-Bold', 7.5)
-            canvas.drawString(ML + 4*mm, PAGE_H - MT - 5.5*mm,
-                              agency.upper())
+            canvas.drawString(ML, text_y, agency.upper())
 
             canvas.setFillColor(NAVY_MUTED)
             canvas.setFont('Helvetica', 7)
-            canvas.drawCentredString(PAGE_W / 2, PAGE_H - MT - 5.5*mm,
+            canvas.drawCentredString(PAGE_W / 2, text_y,
                 f"{agency}  ·  {email}  ·  Prepared {date}")
 
             canvas.setFillColor(GOLD)
             canvas.setFont('Helvetica-Bold', 7.5)
-            canvas.drawRightString(PAGE_W - MR - 4*mm,
-                                   PAGE_H - MT - 5.5*mm, 'SAFARI QUOTE')
+            canvas.drawRightString(PAGE_W - MR, text_y, 'SAFARI QUOTE')
 
         # Footer
         canvas.setStrokeColor(RULE_CLR)
