@@ -97,10 +97,13 @@ def supabase_get(table, params=None):
 
 def supabase_update(table, match_params, update_data):
     if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.error("Supabase credentials missing — cannot update")
         return False
     try:
         query = f"{SUPABASE_URL}/rest/v1/{table}?" + urllib.parse.urlencode(match_params)
         payload = json.dumps(update_data).encode('utf-8')
+        logger.info(f"PATCH URL: {query}")
+        logger.info(f"PATCH body: {update_data}")
         req = urllib.request.Request(query, data=payload, method='PATCH', headers={
             'Authorization': f'Bearer {SUPABASE_KEY}',
             'apikey': SUPABASE_KEY,
@@ -108,11 +111,15 @@ def supabase_update(table, match_params, update_data):
             'Prefer': 'return=representation',
         })
         with urllib.request.urlopen(req, timeout=15) as resp:
-            result = resp.read()
-            logger.info(f"Supabase update response: {result}")
+            result = resp.read().decode()
+            logger.info(f"PATCH response: {result}")
         return True
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode()
+        logger.error(f"Supabase PATCH HTTP error: {e.code} {e.reason} — {error_body}")
+        return False
     except Exception as e:
-        logger.error(f"Supabase update error ({table}): {str(e)}")
+        logger.error(f"Supabase PATCH error: {str(e)}")
         return False
 
 
@@ -358,7 +365,7 @@ def approve():
         </body></html>''', 400
 
     result = supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
-        'status': 'sent'
+        'status': 'approved'
     })
     logger.info(f"Supabase update result for {quote_id}: {result}")
 
