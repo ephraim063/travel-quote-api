@@ -243,7 +243,7 @@ def generate_pdf():
                 'category': a.get('category'),
                 'room_type': a.get('room_type'),
                 'meal_plan': a.get('meal_plan'),
-                'price_per_person_usd': round(a.get('price_per_person_usd_cents', 0) / 100, 2),
+                'price_per_person_usd': round((a.get('price_per_person_usd_cents') or 0) / 100, 2),
             })
 
         transport_for_claude = []
@@ -253,7 +253,7 @@ def generate_pdf():
                 'to': t.get('to_location'),
                 'type': t.get('transport_type'),
                 'operator': t.get('operator_name'),
-                'price_per_person_usd': round(t.get('price_per_person_usd_cents', 0) / 100, 2),
+                'price_per_person_usd': round((t.get('price_per_person_usd_cents') or 0) / 100, 2),
                 'duration_hours': t.get('duration_hours'),
             })
 
@@ -263,7 +263,7 @@ def generate_pdf():
                 'park': f.get('park_name'),
                 'destination': f.get('destination'),
                 'visitor_category': f.get('visitor_category'),
-                'fee_per_person_per_day_usd': round(f.get('fee_per_person_per_day_usd_cents', 0) / 100, 2),
+                'fee_per_person_per_day_usd': round((f.get('fee_per_person_per_day_usd_cents') or 0) / 100, 2),
             })
 
         claude2_prompt = f"""You are a safari itinerary pricing specialist. Build the optimal itinerary using ONLY the exact pricing data provided below.
