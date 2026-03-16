@@ -5,16 +5,10 @@ Flask handles everything:
   2. Fetches agent profile + reviews from Supabase
   3. Fetches accommodations, transport, park fees from Supabase
   4. Calls Claude 2 to build itinerary + pricing
-  5. Calls Claude 3 to write narrative
-  6. Fetches destination photos from Unsplash
-  7. Generates complete PDF
-  8. Uploads PDF to Supabase Storage
-  9. Returns PDF URL + metadata to Make.com
-
-Make.com only needs to send:
-  - agent_id
-  - client details
-  - trip details
+  5. Simple narrative (Claude 3 added later with async)
+  6. Generates complete PDF
+  7. Uploads PDF to Supabase Storage
+  8. Returns PDF URL + metadata to Make.com
 """
 
 import os
@@ -38,7 +32,6 @@ app = Flask(__name__)
 SUPABASE_URL       = os.environ.get('SUPABASE_URL', '').rstrip('/')
 SUPABASE_KEY       = os.environ.get('SUPABASE_SERVICE_KEY', '')
 ANTHROPIC_API_KEY  = os.environ.get('ANTHROPIC_API_KEY', '')
-UNSPLASH_ACCESS_KEY= os.environ.get('UNSPLASH_ACCESS_KEY', '')
 STORAGE_BUCKET     = 'quote-pdfs'
 OUTPUT_DIR         = os.path.join(os.path.dirname(__file__), 'outputs')
 
@@ -47,7 +40,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ─── Supabase helpers ─────────────────────────────────────────────────────────
 def supabase_get(table, params=None):
-    """Fetch rows from a Supabase table."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         logger.warning(f"Supabase credentials missing — skipping {table} fetch")
         return []
@@ -71,7 +63,6 @@ def supabase_get(table, params=None):
 
 
 def supabase_upload(file_path, filename):
-    """Upload PDF to Supabase Storage. Returns public URL."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         return ''
     try:
@@ -98,7 +89,6 @@ def supabase_upload(file_path, filename):
 
 # ─── Claude API helper ────────────────────────────────────────────────────────
 def call_claude(prompt, max_tokens=4000):
-    """Call Claude API and return parsed JSON response."""
     if not ANTHROPIC_API_KEY:
         logger.warning("Anthropic API key missing")
         return {}
@@ -119,12 +109,10 @@ def call_claude(prompt, max_tokens=4000):
                 'content-type': 'application/json',
             }
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             result = json.loads(resp.read().decode())
 
         text = result.get('content', [{}])[0].get('text', '{}')
-
-        # Strip markdown fences if present
         text = text.strip()
         if text.startswith('```'):
             lines = text.split('\n')
@@ -141,33 +129,6 @@ def call_claude(prompt, max_tokens=4000):
         return {}
 
 
-# ─── Unsplash photo fetcher ───────────────────────────────────────────────────
-def fetch_photo(query):
-    """Fetch a destination photo from Unsplash. Returns image bytes or None."""
-    try:
-        if UNSPLASH_ACCESS_KEY:
-            # Use official API if key available
-            url = (f"https://api.unsplash.com/photos/random"
-                   f"?query={urllib.parse.quote(query)}&orientation=landscape"
-                   f"&client_id={UNSPLASH_ACCESS_KEY}")
-            req = urllib.request.Request(url, headers={'User-Agent': 'SafariFlow/4.0'})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-                photo_url = data['urls']['regular']
-        else:
-            # Fallback to source.unsplash.com
-            clean = urllib.parse.quote(query.replace(' ', ','))
-            photo_url = f"https://source.unsplash.com/800x400/?{clean}"
-
-        req = urllib.request.Request(photo_url, headers={'User-Agent': 'SafariFlow/4.0'})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.read()
-
-    except Exception as e:
-        logger.warning(f"Photo fetch failed for '{query}': {str(e)}")
-        return None
-
-
 # ─── Routes ───────────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
@@ -181,7 +142,6 @@ def generate_pdf():
         if not data:
             return jsonify({'error': 'No JSON body received'}), 400
 
-        # ── Extract basic fields from Make.com ────────────────────────────────
         agent_id          = data.get('agent_id', '')
         request_id        = data.get('request_id', str(uuid.uuid4())[:8].upper())
         client_name       = data.get('client_name', '')
@@ -200,71 +160,31 @@ def generate_pdf():
 
         logger.info(f"Generating quote for {client_name} — {destinations}")
 
-        # ── Step 1: Fetch agent data from Supabase ────────────────────────────
+        # ── Step 1: Fetch agent data ──────────────────────────────────────────
         logger.info("Fetching agent data...")
-        agents = supabase_get('agents', {'id': f'eq.{agent_id}', 'select': '*'})
-        agent  = agents[0] if agents else {}
-
+        agents   = supabase_get('agents', {'id': f'eq.{agent_id}', 'select': '*'})
+        agent    = agents[0] if agents else {}
         profiles = supabase_get('agent_profiles', {'agent_id': f'eq.{agent_id}', 'select': '*'})
         profile  = profiles[0] if profiles else {}
+        reviews  = supabase_get('agent_reviews', {'agent_id': f'eq.{agent_id}', 'select': '*', 'limit': '3'})
 
-        reviews = supabase_get('agent_reviews', {'agent_id': f'eq.{agent_id}', 'select': '*', 'limit': '3'})
-
-        # ── Step 2: Fetch pricing data from Supabase ──────────────────────────
+        # ── Step 2: Fetch pricing data ────────────────────────────────────────
         logger.info("Fetching pricing data...")
-        accommodations = supabase_get('accommodations', {
-            'agent_id': f'eq.{agent_id}',
-            'is_active': 'eq.true',
-            'select': '*'
-        })
-
-        transport = supabase_get('transport_routes', {
-            'agent_id': f'eq.{agent_id}',
-            'is_active': 'eq.true',
-            'select': '*'
-        })
-
-        park_fees = supabase_get('park_fees', {
-            'agent_id': f'eq.{agent_id}',
-            'select': '*'
-        })
+        accommodations = supabase_get('accommodations', {'agent_id': f'eq.{agent_id}', 'is_active': 'eq.true', 'select': '*'})
+        transport      = supabase_get('transport_routes', {'agent_id': f'eq.{agent_id}', 'is_active': 'eq.true', 'select': '*'})
+        park_fees      = supabase_get('park_fees', {'agent_id': f'eq.{agent_id}', 'select': '*'})
 
         logger.info(f"Found: {len(accommodations)} accommodations, {len(transport)} transport, {len(park_fees)} park fees")
 
         # ── Step 3: Call Claude 2 — Build Itinerary ───────────────────────────
         logger.info("Calling Claude 2 — Build Itinerary...")
 
-        # Convert cents to USD for Claude
-        accom_for_claude = []
-        for a in accommodations:
-            accom_for_claude.append({
-                'name': a.get('name'),
-                'destination': a.get('destination'),
-                'category': a.get('category'),
-                'room_type': a.get('room_type'),
-                'meal_plan': a.get('meal_plan'),
-                'price_per_person_usd': round((a.get('price_per_person_usd_cents') or 0) / 100, 2),
-            })
+        def cents_to_usd(val):
+            return round((val or 0) / 100, 2)
 
-        transport_for_claude = []
-        for t in transport:
-            transport_for_claude.append({
-                'from': t.get('from_location'),
-                'to': t.get('to_location'),
-                'type': t.get('transport_type'),
-                'operator': t.get('operator_name'),
-                'price_per_person_usd': round((t.get('price_per_person_usd_cents') or 0) / 100, 2),
-                'duration_hours': t.get('duration_hours'),
-            })
-
-        fees_for_claude = []
-        for f in park_fees:
-            fees_for_claude.append({
-                'park': f.get('park_name'),
-                'destination': f.get('destination'),
-                'visitor_category': f.get('visitor_category'),
-                'fee_per_person_per_day_usd': round((f.get('fee_per_person_per_day_usd_cents') or 0) / 100, 2),
-            })
+        accom_for_claude = [{'name': a.get('name'), 'destination': a.get('destination'), 'category': a.get('category'), 'room_type': a.get('room_type'), 'meal_plan': a.get('meal_plan'), 'price_per_person_usd': cents_to_usd(a.get('price_per_person_usd_cents'))} for a in accommodations]
+        transport_for_claude = [{'from': t.get('from_location'), 'to': t.get('to_location'), 'type': t.get('transport_type'), 'operator': t.get('operator_name'), 'price_per_person_usd': cents_to_usd(t.get('price_per_person_usd_cents')), 'duration_hours': t.get('duration_hours')} for t in transport]
+        fees_for_claude = [{'park': f.get('park_name'), 'destination': f.get('destination'), 'visitor_category': f.get('visitor_category'), 'fee_per_person_per_day_usd': cents_to_usd(f.get('fee_per_person_per_day_usd_cents'))} for f in park_fees]
 
         claude2_prompt = f"""You are a safari itinerary pricing specialist. Build the optimal itinerary using ONLY the exact pricing data provided below.
 
@@ -313,18 +233,7 @@ RULES:
 - deposit_amount_usd = total * 0.30
 
 TRIP REQUIREMENTS:
-{json.dumps({
-    "destinations": destinations,
-    "duration_days": duration_days,
-    "start_date": start_date,
-    "end_date": end_date,
-    "pax_adults": pax_adults,
-    "pax_children": pax_children,
-    "accommodation_tier": accommodation_tier,
-    "budget_usd": budget_usd,
-    "special_requests": special_requests,
-    "visitor_category": "non_resident" if client_nationality.lower() not in ['kenyan', 'tanzanian', 'ugandan'] else "resident"
-}, indent=2)}
+{json.dumps({"destinations": destinations, "duration_days": duration_days, "start_date": start_date, "end_date": end_date, "pax_adults": pax_adults, "pax_children": pax_children, "accommodation_tier": accommodation_tier, "budget_usd": budget_usd, "special_requests": special_requests, "visitor_category": "non_resident" if client_nationality.lower() not in ['kenyan', 'tanzanian', 'ugandan'] else "resident"}, indent=2)}
 
 AVAILABLE ACCOMMODATIONS:
 {json.dumps(accom_for_claude, indent=2)}
@@ -336,7 +245,6 @@ PARK FEES:
 {json.dumps(fees_for_claude, indent=2)}"""
 
         itinerary_data = call_claude(claude2_prompt, max_tokens=4000)
-
         itinerary  = itinerary_data.get('itinerary', [])
         line_items = itinerary_data.get('line_items', [])
         total_price= float(itinerary_data.get('total_price_usd', 0) or 0)
@@ -345,62 +253,29 @@ PARK FEES:
 
         logger.info(f"Itinerary built: {len(itinerary)} days, total ${total_price}")
 
-        # ── Step 4: Call Claude 3 — Write Narrative ───────────────────────────
-        logger.info("Calling Claude 3 — Write Narrative...")
+        # ── Step 4: Simple narrative — Claude 3 added later with async ────────
+        logger.info("Building simple narrative...")
+        first_name = client_name.split()[0] if client_name else "Dear Guest"
+        intro_narrative = f"{first_name}, your {duration_days}-day safari across {destinations} has been carefully crafted to deliver an authentic East African experience. Every detail has been arranged to ensure your journey is seamless and unforgettable from start to finish."
+        narrative_days = []
+        for day in itinerary:
+            narrative_days.append({
+                'day_number': day.get('day_number'),
+                'narrative': f"Today you explore {day.get('destination')} with your expert guide, discovering the remarkable wildlife and landscapes that make this destination truly special.",
+                'highlight': f"Wildlife encounters in {day.get('destination')}",
+                'accommodation_description': f"{day.get('accommodation_name')}, {day.get('room_type')} — your comfortable base for the night."
+            })
+        logger.info(f"Narrative ready: {len(narrative_days)} days")
 
-        claude3_prompt = f"""You are a luxury safari copywriter. Write compelling narrative text for this safari itinerary.
-
-Return ONLY a valid JSON object. No explanation. No markdown. No code fences. No backticks. Start your response with {{ and end with }}.
-
-Structure:
-{{
-  "intro_narrative": "2-3 sentence personalised opening addressing client by first name",
-  "days": [
-    {{
-      "day_number": 1,
-      "narrative": "2-3 sentence description of the day",
-      "highlight": "One memorable highlight line — max 12 words",
-      "accommodation_description": "Property name, room type, one evocative sentence"
-    }}
-  ]
-}}
-
-TONE: Warm, aspirational, professional. Use client first name.
-Never use clichés like 'breathtaking' or 'once in a lifetime'.
-Focus on sensory details, wildlife, authentic African experiences.
-
-CLIENT NAME: {client_name}
-SPECIAL REQUESTS: {special_requests}
-
-ITINERARY:
-{json.dumps(itinerary, indent=2)}"""
-
-        narrative_data = call_claude(claude3_prompt, max_tokens=3000)
-
-        intro_narrative = narrative_data.get('intro_narrative', '')
-        narrative_days  = narrative_data.get('days', [])
-
-        logger.info(f"Narrative written: {len(narrative_days)} days")
-
-        # ── Step 5: Fetch destination photos ──────────────────────────────────
-        # ── Step 5: Photos disabled for speed — re-enable after pipeline confirmed ────
-        logger.info("Photos disabled for speed testing...")
+        # ── Step 5: Photos disabled for speed — re-enable later ───────────────
         photo_cache = {}
 
-        # ── Step 6: Build complete PDF data structure ─────────────────────────
+        # ── Step 6: Build PDF data structure ─────────────────────────────────
         quote_number = f"QT-{request_id}"
         filename     = f"SafariFlow_Quote_{quote_number}.pdf"
         output_path  = os.path.join(OUTPUT_DIR, filename)
 
-        # Parse reviews for trust page
-        reviews_formatted = []
-        for r in reviews:
-            reviews_formatted.append({
-                'review_text':   r.get('review_text', ''),
-                'client_name':   r.get('client_name', ''),
-                'client_origin': r.get('client_origin', ''),
-                'trip_summary':  r.get('trip_summary', ''),
-            })
+        reviews_formatted = [{'review_text': r.get('review_text', ''), 'client_name': r.get('client_name', ''), 'client_origin': r.get('client_origin', ''), 'trip_summary': r.get('trip_summary', '')} for r in reviews]
 
         pdf_data = {
             'quote_id':     quote_number,
@@ -410,7 +285,6 @@ ITINERARY:
             'inclusions':   '- All accommodation as specified\n- All meals as per itinerary\n- All game drives\n- Park and conservancy fees\n- Internal flights as specified\n- Airport transfers',
             'exclusions':   '- International flights\n- Travel insurance\n- Visa fees\n- Personal expenses\n- Gratuities',
             'terms':        'This quote is valid for 14 days. A 30% deposit is required to confirm the booking. Balance due 60 days prior to departure.',
-
             'agent': {
                 'name':    agent.get('agent_name', ''),
                 'email':   agent.get('email', ''),
@@ -419,7 +293,6 @@ ITINERARY:
                 'logo_url':agent.get('logo_url', ''),
                 'website': agent.get('website', ''),
             },
-
             'client': {
                 'name':        client_name,
                 'email':       client_email,
@@ -428,7 +301,6 @@ ITINERARY:
                 'pax_children':str(pax_children),
                 'nationality': client_nationality,
             },
-
             'trip': {
                 'title':           f"{duration_days}-Day {destinations} Safari",
                 'start_date':      start_date,
@@ -437,11 +309,9 @@ ITINERARY:
                 'destinations':    destinations,
                 'travel_style':    accommodation_tier.title(),
             },
-
             'itinerary':    itinerary,
             'line_items':   line_items,
             'photo_cache':  photo_cache,
-
             'pricing': {
                 'total_price_usd':    total_price,
                 'deposit_amount_usd': deposit,
@@ -449,12 +319,10 @@ ITINERARY:
                 'within_budget':      itinerary_data.get('within_budget', True),
                 'budget_notes':       itinerary_data.get('budget_notes', ''),
             },
-
             'narrative': {
                 'intro': intro_narrative,
                 'days':  narrative_days,
             },
-
             'agent_profile': {
                 'tagline':          profile.get('tagline', 'Travel & Safari Specialists'),
                 'bio':              profile.get('bio', ''),
@@ -468,7 +336,6 @@ ITINERARY:
                 'instagram':        profile.get('instagram', ''),
                 'linkedin':         profile.get('linkedin', ''),
             },
-
             'agent_reviews': reviews_formatted,
         }
 
