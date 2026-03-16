@@ -40,7 +40,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ─── JWT-style token helpers ──────────────────────────────────────────────────
 def generate_token(quote_id, action):
-    """Generate a signed token for approve/reject actions."""
     expires = int(time.time()) + (TOKEN_EXPIRY_DAYS * 86400)
     payload = f"{quote_id}:{action}:{expires}"
     sig = hmac.new(
@@ -53,7 +52,6 @@ def generate_token(quote_id, action):
 
 
 def verify_token(token, expected_action):
-    """Verify a token. Returns quote_id if valid, None if invalid/expired."""
     try:
         decoded = base64.urlsafe_b64decode(token.encode()).decode()
         parts = decoded.split(':')
@@ -98,7 +96,6 @@ def supabase_get(table, params=None):
 
 
 def supabase_update(table, match_params, update_data):
-    """Update rows in a Supabase table."""
     if not SUPABASE_URL or not SUPABASE_KEY:
         return False
     try:
@@ -111,7 +108,8 @@ def supabase_update(table, match_params, update_data):
             'Prefer': 'return=representation',
         })
         with urllib.request.urlopen(req, timeout=15) as resp:
-            resp.read()
+            result = resp.read()
+            logger.info(f"Supabase update response: {result}")
         return True
     except Exception as e:
         logger.error(f"Supabase update error ({table}): {str(e)}")
@@ -141,7 +139,6 @@ def supabase_upload(file_path, filename):
 
 
 def trigger_make_webhook(webhook_url, payload):
-    """Fire a Make.com webhook."""
     if not webhook_url:
         logger.warning("Make webhook URL not set")
         return False
@@ -224,21 +221,18 @@ def generate_pdf():
 
         logger.info(f"Generating quote for {client_name} — {destinations}")
 
-        # ── Fetch agent data ──────────────────────────────────────────────────
         agents   = supabase_get('agents', {'id': f'eq.{agent_id}', 'select': '*'})
         agent    = agents[0] if agents else {}
         profiles = supabase_get('agent_profiles', {'agent_id': f'eq.{agent_id}', 'select': '*'})
         profile  = profiles[0] if profiles else {}
         reviews  = supabase_get('agent_reviews', {'agent_id': f'eq.{agent_id}', 'select': '*', 'limit': '3'})
 
-        # ── Fetch pricing data ────────────────────────────────────────────────
         accommodations = supabase_get('accommodations', {'agent_id': f'eq.{agent_id}', 'is_active': 'eq.true', 'select': '*'})
         transport      = supabase_get('transport_routes', {'agent_id': f'eq.{agent_id}', 'is_active': 'eq.true', 'select': '*'})
         park_fees      = supabase_get('park_fees', {'agent_id': f'eq.{agent_id}', 'select': '*'})
 
         logger.info(f"Found: {len(accommodations)} accommodations, {len(transport)} transport, {len(park_fees)} park fees")
 
-        # ── Build itinerary with Claude 2 ─────────────────────────────────────
         def cents(val):
             return round((val or 0) / 100, 2)
 
@@ -275,12 +269,10 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
 
         logger.info(f"Itinerary built: {len(itinerary)} days, total ${total_price}")
 
-        # ── Simple narrative ──────────────────────────────────────────────────
         first_name = client_name.split()[0] if client_name else "Dear Guest"
         intro_narrative = f"{first_name}, your {duration_days}-day safari across {destinations} has been carefully crafted to deliver an authentic East African experience. Every detail has been arranged to ensure your journey is seamless and unforgettable."
         narrative_days = [{'day_number': d.get('day_number'), 'narrative': f"Today you explore {d.get('destination')} with your expert guide, discovering the remarkable wildlife and landscapes that make this destination truly special.", 'highlight': f"Wildlife encounters in {d.get('destination')}", 'accommodation_description': f"{d.get('accommodation_name')}, {d.get('room_type')} — your comfortable base for the night."} for d in itinerary]
 
-        # ── Generate quote number + approval tokens ───────────────────────────
         quote_number  = f"QT-{request_id}"
         approve_token = generate_token(quote_number, 'approve')
         reject_token  = generate_token(quote_number, 'reject')
@@ -289,7 +281,6 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
 
         logger.info(f"Approval tokens generated for {quote_number}")
 
-        # ── Build PDF ─────────────────────────────────────────────────────────
         filename    = f"SafariFlow_Quote_{quote_number}.pdf"
         output_path = os.path.join(OUTPUT_DIR, filename)
 
@@ -366,12 +357,11 @@ def approve():
             <p>This approval link is invalid or has expired.</p>
         </body></html>''', 400
 
-    # Update quote status in Supabase
-    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
-        'status': 'approved',   
+    result = supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
+        'status': 'approved'
     })
+    logger.info(f"Supabase update result for {quote_id}: {result}")
 
-    # Trigger Make.com Scenario 2
     trigger_make_webhook(MAKE_S2_WEBHOOK, {
         'event': 'quote_approved',
         'quote_number': quote_id,
@@ -382,7 +372,7 @@ def approve():
 
     return '''<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#f9f9f9">
         <div style="max-width:500px;margin:0 auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1)">
-            <div style="font-size:48px;margin-bottom:16px">✅</div>
+            <div style="font-size:48px;margin-bottom:16px">&#x2705;</div>
             <h2 style="color:#1B2A47;margin-bottom:8px">Quote Approved</h2>
             <p style="color:#666">The quote has been approved and will be sent to the client shortly.</p>
             <p style="color:#C4922A;font-weight:bold;font-size:14px">''' + quote_id + '''</p>
@@ -402,12 +392,11 @@ def reject():
             <p>This link is invalid or has expired.</p>
         </body></html>''', 400
 
-    # Update quote status in Supabase
-    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
-        'status': 'revision_requested',        
+    result = supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
+        'status': 'revision_requested'
     })
-logger.info(f"Supabase update result for {quote_id}: {result}")
-    # Trigger Make.com Scenario 2
+    logger.info(f"Supabase update result for {quote_id}: {result}")
+
     trigger_make_webhook(MAKE_S2_WEBHOOK, {
         'event': 'quote_rejected',
         'quote_number': quote_id,
@@ -418,7 +407,7 @@ logger.info(f"Supabase update result for {quote_id}: {result}")
 
     return '''<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#f9f9f9">
         <div style="max-width:500px;margin:0 auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1)">
-            <div style="font-size:48px;margin-bottom:16px">✏️</div>
+            <div style="font-size:48px;margin-bottom:16px">&#x270F;&#xFE0F;</div>
             <h2 style="color:#1B2A47;margin-bottom:8px">Revision Requested</h2>
             <p style="color:#666">The quote has been flagged for revision. You will be notified when it is ready to review again.</p>
             <p style="color:#C4922A;font-weight:bold;font-size:14px">''' + quote_id + '''</p>
