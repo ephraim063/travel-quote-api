@@ -602,34 +602,48 @@ def build_inclusions_terms(data, S, story):
     accept_url  = safe(data.get('accept_url'), '#')
     changes_url = safe(data.get('changes_url'), '#')
 
+    INCL_BG = HexColor('#F0FAF0')   # very light green
+    EXCL_BG = HexColor('#FFF5F5')   # very light red
+
     col_w = (CW - 6*mm) / 2
     left_elems = []
     right_elems = []
 
     if inclusions and inclusions != '—':
+        left_elems.append(Spacer(1, 2*mm))
         left_elems.append(Paragraph('INCLUDED IN THIS PACKAGE', S['section']))
-        left_elems.append(hr(width=col_w))
+        left_elems.append(hr(width=col_w - 8*mm, color=HexColor('#4A9E4A')))
         for line in inclusions.split('\n'):
             line = line.strip().lstrip('-•✓').strip()
             if line:
-                left_elems.append(Paragraph(f"✓  {line}", S['body_sm']))
+                left_elems.append(Paragraph(
+                    f'<font color="#2D6B2D">✓</font>  {line}', S['body_sm']))
+        left_elems.append(Spacer(1, 2*mm))
 
     if exclusions and exclusions != '—':
+        right_elems.append(Spacer(1, 2*mm))
         right_elems.append(Paragraph('NOT INCLUDED', S['section']))
-        right_elems.append(hr(width=col_w))
+        right_elems.append(hr(width=col_w - 8*mm, color=HexColor('#C94040')))
         for line in exclusions.split('\n'):
             line = line.strip().lstrip('-•✕✗').strip()
             if line:
-                right_elems.append(Paragraph(f"✕  {line}", S['body_sm']))
+                right_elems.append(Paragraph(
+                    f'<font color="#B03030">✕</font>  {line}', S['body_sm']))
+        right_elems.append(Spacer(1, 2*mm))
 
     if left_elems or right_elems:
         inc_t = Table([[left_elems, right_elems]],
                       colWidths=[col_w, col_w])
         inc_t.setStyle(TableStyle([
-            ('VALIGN',       (0,0), (-1,-1), 'TOP'),
-            ('LEFTPADDING',  (0,0), (-1,-1), 0),
-            ('RIGHTPADDING', (0,0), (-1,-1), 0),
-            ('TOPPADDING',   (0,0), (-1,-1), 0),
+            ('VALIGN',        (0,0), (-1,-1), 'TOP'),
+            ('LEFTPADDING',   (0,0), (-1,-1), 8),
+            ('RIGHTPADDING',  (0,0), (-1,-1), 8),
+            ('TOPPADDING',    (0,0), (-1,-1), 0),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+            ('BACKGROUND',    (0,0), (0,-1),  INCL_BG),
+            ('BACKGROUND',    (1,0), (1,-1),  EXCL_BG),
+            ('BOX',           (0,0), (0,-1),  0.3, HexColor('#4A9E4A')),
+            ('BOX',           (1,0), (1,-1),  0.3, HexColor('#C94040')),
         ]))
         story.append(inc_t)
 
