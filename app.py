@@ -383,15 +383,9 @@ ITINERARY:
         logger.info(f"Narrative written: {len(narrative_days)} days")
 
         # ── Step 5: Fetch destination photos ──────────────────────────────────
-        logger.info("Fetching destination photos...")
+        # ── Step 5: Photos disabled for speed — re-enable after pipeline confirmed ────
+        logger.info("Photos disabled for speed testing...")
         photo_cache = {}
-        for day in itinerary:
-            query = day.get('image_search_query', day.get('destination', 'safari Kenya'))
-            if query not in photo_cache:
-                photo_bytes = fetch_photo(query)
-                photo_cache[query] = photo_bytes
-                if photo_bytes:
-                    logger.info(f"Photo fetched for: {query}")
 
         # ── Step 6: Build complete PDF data structure ─────────────────────────
         quote_number = f"QT-{request_id}"
