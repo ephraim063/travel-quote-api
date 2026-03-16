@@ -367,9 +367,8 @@ def approve():
         </body></html>''', 400
 
     # Update quote status in Supabase
-   supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
-    'status': 'approved'
-    })
+    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
+        'status': 'approved',   
     })
 
     # Trigger Make.com Scenario 2
@@ -405,8 +404,7 @@ def reject():
 
     # Update quote status in Supabase
     supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
-        'status': 'revision_requested',
-        'updated_at': 'now()'
+        'status': 'revision_requested',        
     })
 
     # Trigger Make.com Scenario 2
