@@ -88,6 +88,15 @@ def generate_pdf():
         if not data:
             return jsonify({'error': 'No JSON body received'}), 400
 
+        # ── Debug logging — remove after confirming data flow ─────────────────
+        logger.info(f"PAYLOAD KEYS: {list(data.keys())}")
+        logger.info(f"client_name: {data.get('client_name', 'MISSING')}")
+        logger.info(f"itinerary_json length: {len(str(data.get('itinerary_json', '')))} chars")
+        logger.info(f"line_items_json length: {len(str(data.get('line_items_json', '')))} chars")
+        logger.info(f"intro_narrative: {str(data.get('intro_narrative', 'MISSING'))[:100]}")
+        logger.info(f"total_price_usd: {data.get('total_price_usd', 'MISSING')}")
+        logger.info(f"destination: {data.get('destination', 'MISSING')}")
+
         # ── Extract fields from Make.com payload ──────────────────────────────
         # Agent fields from Supabase-Fetch Agent (Module 42)
         agent_name   = data.get('agent_name', '')
