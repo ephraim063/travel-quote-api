@@ -358,7 +358,7 @@ def approve():
         </body></html>''', 400
 
     result = supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
-        'status': 'approved'
+        'status': 'sent'
     })
     logger.info(f"Supabase update result for {quote_id}: {result}")
 
