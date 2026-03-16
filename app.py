@@ -86,7 +86,7 @@ def supabase_upload(file_path, filename):
                 'x-upsert': 'true',
             }
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             resp.read()
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{filename}"
         logger.info(f"Uploaded to Supabase Storage: {public_url}")
