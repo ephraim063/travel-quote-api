@@ -108,7 +108,7 @@ def supabase_update(table, match_params, update_data):
             'Authorization': f'Bearer {SUPABASE_KEY}',
             'apikey': SUPABASE_KEY,
             'Content-Type': 'application/json',
-            'Prefer': 'return=representation',
+            'Prefer': 'return=minimal',
         })
         with urllib.request.urlopen(req, timeout=15) as resp:
             result = resp.read().decode()
