@@ -280,11 +280,15 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
         intro_narrative = f"{first_name}, your {duration_days}-day safari across {destinations} has been carefully crafted to deliver an authentic East African experience. Every detail has been arranged to ensure your journey is seamless and unforgettable."
         narrative_days = [{'day_number': d.get('day_number'), 'narrative': f"Today you explore {d.get('destination')} with your expert guide, discovering the remarkable wildlife and landscapes that make this destination truly special.", 'highlight': f"Wildlife encounters in {d.get('destination')}", 'accommodation_description': f"{d.get('accommodation_name')}, {d.get('room_type')} — your comfortable base for the night."} for d in itinerary]
 
-        quote_number  = f"QT-{request_id}"
-        approve_token = generate_token(quote_number, 'approve')
-        reject_token  = generate_token(quote_number, 'reject')
-        approve_url   = f"{API_BASE_URL}/approve?token={approve_token}"
-        reject_url    = f"{API_BASE_URL}/reject?token={reject_token}"
+        quote_number         = f"QT-{request_id}"
+        approve_token        = generate_token(quote_number, 'approve')
+        reject_token         = generate_token(quote_number, 'reject')
+        client_accept_token  = generate_token(quote_number, 'client-accept')
+        client_changes_token = generate_token(quote_number, 'client-changes')
+        approve_url          = f"{API_BASE_URL}/approve?token={approve_token}"
+        reject_url           = f"{API_BASE_URL}/reject?token={reject_token}"
+        client_accept_url    = f"{API_BASE_URL}/client-accept?token={client_accept_token}"
+        client_changes_url   = f"{API_BASE_URL}/client-changes?token={client_changes_token}"
 
         logger.info(f"Approval tokens generated for {quote_number}")
 
@@ -328,23 +332,25 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
             'filename':       filename,
             'quote_number':   quote_number,
             'pdf_base64':     pdf_base64,
-            'pdf_url':        pdf_url,
-            'file_size':      len(pdf_bytes),
-            'client_name':    client_name,
-            'client_email':   client_email,
-            'agent_email':    agent.get('email', ''),
-            'agent_name':     agent.get('agent_name', ''),
-            'agency_name':    agent.get('agency_name', ''),
-            'quote_date':     start_date[:10] if start_date else '',
-            'total_price_usd':total_price,
-            'deposit_usd':    deposit,
-            'balance_usd':    balance,
-            'itinerary_days': len(itinerary),
-            'approve_url':    approve_url,
-            'reject_url':     reject_url,
-            'destinations':   destinations,
-            'start_date':     start_date,
-            'end_date':       end_date,
+            'pdf_url':           pdf_url,
+            'file_size':         len(pdf_bytes),
+            'client_name':       client_name,
+            'client_email':      client_email,
+            'agent_email':       agent.get('email', ''),
+            'agent_name':        agent.get('agent_name', ''),
+            'agency_name':       agent.get('agency_name', ''),
+            'quote_date':        start_date[:10] if start_date else '',
+            'total_price_usd':   total_price,
+            'deposit_usd':       deposit,
+            'balance_usd':       balance,
+            'itinerary_days':    len(itinerary),
+            'approve_url':       approve_url,
+            'reject_url':        reject_url,
+            'client_accept_url': client_accept_url,
+            'client_changes_url':client_changes_url,
+            'destinations':      destinations,
+            'start_date':        start_date,
+            'end_date':          end_date,
         })
 
     except Exception as e:
@@ -417,6 +423,74 @@ def reject():
             <div style="font-size:48px;margin-bottom:16px">&#x270F;&#xFE0F;</div>
             <h2 style="color:#1B2A47;margin-bottom:8px">Revision Requested</h2>
             <p style="color:#666">The quote has been flagged for revision. You will be notified when it is ready to review again.</p>
+            <p style="color:#C4922A;font-weight:bold;font-size:14px">''' + quote_id + '''</p>
+        </div>
+    </body></html>'''
+
+
+# ─── Client Accept endpoint ───────────────────────────────────────────────────
+@app.route('/client-accept', methods=['GET'])
+def client_accept():
+    token = request.args.get('token', '')
+    quote_id = verify_token(token, 'client-accept')
+
+    if not quote_id:
+        return '''<html><body style="font-family:sans-serif;text-align:center;padding:60px">
+            <h2 style="color:#c0392b">Invalid or Expired Link</h2>
+            <p>This link is invalid or has expired.</p>
+        </body></html>''', 400
+
+    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
+        'status': 'accepted'
+    })
+
+    trigger_make_webhook(MAKE_S2_WEBHOOK, {
+        'event': 'quote_accepted',
+        'quote_number': quote_id,
+        'accepted_at': int(time.time()),
+    })
+
+    logger.info(f"Quote accepted by client: {quote_id}")
+
+    return '''<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#f9f9f9">
+        <div style="max-width:500px;margin:0 auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1)">
+            <div style="font-size:48px;margin-bottom:16px">&#x1F389;</div>
+            <h2 style="color:#1B2A47;margin-bottom:8px">Quote Accepted!</h2>
+            <p style="color:#666">Thank you! Your safari booking is confirmed. Your travel specialist will be in touch shortly with payment details.</p>
+            <p style="color:#C4922A;font-weight:bold;font-size:14px">''' + quote_id + '''</p>
+        </div>
+    </body></html>'''
+
+
+# ─── Client Changes endpoint ──────────────────────────────────────────────────
+@app.route('/client-changes', methods=['GET'])
+def client_changes():
+    token = request.args.get('token', '')
+    quote_id = verify_token(token, 'client-changes')
+
+    if not quote_id:
+        return '''<html><body style="font-family:sans-serif;text-align:center;padding:60px">
+            <h2 style="color:#c0392b">Invalid or Expired Link</h2>
+            <p>This link is invalid or has expired.</p>
+        </body></html>''', 400
+
+    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
+        'status': 'revision_requested'
+    })
+
+    trigger_make_webhook(MAKE_S2_WEBHOOK, {
+        'event': 'client_changes_requested',
+        'quote_number': quote_id,
+        'requested_at': int(time.time()),
+    })
+
+    logger.info(f"Client requested changes: {quote_id}")
+
+    return '''<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#f9f9f9">
+        <div style="max-width:500px;margin:0 auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1)">
+            <div style="font-size:48px;margin-bottom:16px">&#x270F;&#xFE0F;</div>
+            <h2 style="color:#1B2A47;margin-bottom:8px">Changes Requested</h2>
+            <p style="color:#666">Your request has been received. Your travel specialist will review your feedback and send you an updated quote shortly.</p>
             <p style="color:#C4922A;font-weight:bold;font-size:14px">''' + quote_id + '''</p>
         </div>
     </body></html>'''
