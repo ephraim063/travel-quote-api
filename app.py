@@ -33,7 +33,7 @@ API_BASE_URL        = os.environ.get('API_BASE_URL', 'https://travel-quote-api.o
 PORTAL_URL          = os.environ.get('PORTAL_URL', 'https://safariflow-portal.netlify.app')
 STORAGE_BUCKET      = 'quote-pdfs'
 OUTPUT_DIR          = os.path.join(os.path.dirname(__file__), 'outputs')
-TOKEN_EXPIRY_DAYS   = 7
+TOKEN_EXPIRY_DAYS   = 14
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -108,7 +108,7 @@ def supabase_update(table, match_params, update_data):
             'Authorization': f'Bearer {SUPABASE_KEY}',
             'apikey': SUPABASE_KEY,
             'Content-Type': 'application/json',
-            'Prefer': 'return=minimal',
+            'Prefer': 'return=representation',
         })
         with urllib.request.urlopen(req, timeout=15) as resp:
             result = resp.read().decode()
@@ -358,142 +358,153 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
         return jsonify({'error': str(e)}), 500
 
 
-# ─── Agent Approve endpoint ───────────────────────────────────────────────────
+# ─── Helper: confirmation page ────────────────────────────────────────────────
+def confirmation_page(token, action, title, message, button_label, button_color, icon):
+    return f'''<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SafariFlow</title></head>
+<body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f4;">
+<div style="max-width:500px;margin:60px auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1);text-align:center;">
+    <div style="font-size:48px;margin-bottom:16px">{icon}</div>
+    <h2 style="color:#1B2A47;margin-bottom:8px">{title}</h2>
+    <p style="color:#444;margin-bottom:24px">{message}</p>
+    <form method="POST" action="/{action}-confirm">
+        <input type="hidden" name="token" value="{token}">
+        <button type="submit" style="background:{button_color};color:white;border:none;padding:14px 32px;border-radius:6px;font-size:15px;font-weight:bold;cursor:pointer;margin-right:12px;">
+            {button_label}
+        </button>
+        <a href="javascript:history.back()" style="display:inline-block;background:#ccc;color:white;padding:14px 24px;border-radius:6px;font-size:15px;font-weight:bold;text-decoration:none;">
+            Cancel
+        </a>
+    </form>
+</div>
+</body></html>'''
+
+
+def success_page(icon, title, message, quote_id):
+    return f'''<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SafariFlow</title></head>
+<body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f4;">
+<div style="max-width:500px;margin:60px auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1);text-align:center;">
+    <div style="font-size:48px;margin-bottom:16px">{icon}</div>
+    <h2 style="color:#1B2A47;margin-bottom:8px">{title}</h2>
+    <p style="color:#444">{message}</p>
+    <p style="color:#C4922A;font-weight:bold;font-size:14px;margin-top:16px">{quote_id}</p>
+</div>
+</body></html>'''
+
+
+def invalid_page():
+    return '''<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head>
+<body style="font-family:Arial,sans-serif;text-align:center;padding:60px;background:#f4f4f4;">
+<div style="max-width:500px;margin:0 auto;background:white;padding:40px;border-radius:12px;">
+    <h2 style="color:#c0392b">Invalid or Expired Link</h2>
+    <p style="color:#444">This link is invalid or has expired. Please contact your travel specialist.</p>
+</div></body></html>''', 400
+
+
+# ─── Agent Approve ────────────────────────────────────────────────────────────
 @app.route('/approve', methods=['GET'])
 def approve():
     token = request.args.get('token', '')
     quote_id = verify_token(token, 'approve')
-
     if not quote_id:
-        return '''<html><body style="font-family:sans-serif;text-align:center;padding:60px">
-            <h2 style="color:#c0392b">Invalid or Expired Link</h2>
-            <p>This approval link is invalid or has expired.</p>
-        </body></html>''', 400
+        return invalid_page()
+    return confirmation_page(token, 'approve',
+        'Approve This Quote',
+        f'You are about to approve quote <strong>{quote_id}</strong> and send it to the client. Are you sure?',
+        'Yes, Approve & Send', '#1B2A47', '&#x2705;')
 
-    result = supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
-        'status': 'sent'
-    })
-    logger.info(f"Supabase update result for {quote_id}: {result}")
 
-    trigger_make_webhook(MAKE_S2_WEBHOOK, {
-        'event': 'quote_approved',
-        'quote_number': quote_id,
-        'approved_at': int(time.time()),
-    })
-
+@app.route('/approve-confirm', methods=['POST'])
+def approve_confirm():
+    token = request.form.get('token', '')
+    quote_id = verify_token(token, 'approve')
+    if not quote_id:
+        return invalid_page()
+    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {'status': 'sent'})
+    trigger_make_webhook(MAKE_S2_WEBHOOK, {'event': 'quote_approved', 'quote_number': quote_id, 'approved_at': int(time.time())})
     logger.info(f"Quote approved: {quote_id}")
-
-    return '''<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#f9f9f9">
-        <div style="max-width:500px;margin:0 auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1)">
-            <div style="font-size:48px;margin-bottom:16px">&#x2705;</div>
-            <h2 style="color:#1B2A47;margin-bottom:8px">Quote Approved</h2>
-            <p style="color:#666">The quote has been approved and will be sent to the client shortly.</p>
-            <p style="color:#C4922A;font-weight:bold;font-size:14px">''' + quote_id + '''</p>
-        </div>
-    </body></html>'''
+    return success_page('&#x2705;', 'Quote Approved', 'The quote has been approved and will be sent to the client shortly.', quote_id)
 
 
-# ─── Agent Reject endpoint ────────────────────────────────────────────────────
+# ─── Agent Reject ─────────────────────────────────────────────────────────────
 @app.route('/reject', methods=['GET'])
 def reject():
     token = request.args.get('token', '')
     quote_id = verify_token(token, 'reject')
-
     if not quote_id:
-        return '''<html><body style="font-family:sans-serif;text-align:center;padding:60px">
-            <h2 style="color:#c0392b">Invalid or Expired Link</h2>
-            <p>This link is invalid or has expired.</p>
-        </body></html>''', 400
+        return invalid_page()
+    return confirmation_page(token, 'reject',
+        'Request Changes',
+        f'You are about to flag quote <strong>{quote_id}</strong> for revision. Are you sure?',
+        'Yes, Request Changes', '#C4922A', '&#x270F;&#xFE0F;')
 
-    result = supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
-        'status': 'revision_requested'
-    })
-    logger.info(f"Supabase update result for {quote_id}: {result}")
 
-    trigger_make_webhook(MAKE_S2_WEBHOOK, {
-        'event': 'quote_rejected',
-        'quote_number': quote_id,
-        'rejected_at': int(time.time()),
-    })
-
+@app.route('/reject-confirm', methods=['POST'])
+def reject_confirm():
+    token = request.form.get('token', '')
+    quote_id = verify_token(token, 'reject')
+    if not quote_id:
+        return invalid_page()
+    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {'status': 'revision_requested'})
+    trigger_make_webhook(MAKE_S2_WEBHOOK, {'event': 'quote_rejected', 'quote_number': quote_id, 'rejected_at': int(time.time())})
     logger.info(f"Quote rejected: {quote_id}")
-
-    return '''<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#f9f9f9">
-        <div style="max-width:500px;margin:0 auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1)">
-            <div style="font-size:48px;margin-bottom:16px">&#x270F;&#xFE0F;</div>
-            <h2 style="color:#1B2A47;margin-bottom:8px">Revision Requested</h2>
-            <p style="color:#666">The quote has been flagged for revision. You will be notified when it is ready to review again.</p>
-            <p style="color:#C4922A;font-weight:bold;font-size:14px">''' + quote_id + '''</p>
-        </div>
-    </body></html>'''
+    return success_page('&#x270F;&#xFE0F;', 'Revision Requested', 'The quote has been flagged for revision. You will be notified when it is ready to review again.', quote_id)
 
 
-# ─── Client Accept endpoint ───────────────────────────────────────────────────
+# ─── Client Accept ────────────────────────────────────────────────────────────
 @app.route('/client-accept', methods=['GET'])
 def client_accept():
     token = request.args.get('token', '')
     quote_id = verify_token(token, 'client-accept')
-
     if not quote_id:
-        return '''<html><body style="font-family:sans-serif;text-align:center;padding:60px">
-            <h2 style="color:#c0392b">Invalid or Expired Link</h2>
-            <p>This link is invalid or has expired.</p>
-        </body></html>''', 400
+        return invalid_page()
+    return confirmation_page(token, 'client-accept',
+        'Accept This Quote',
+        f'You are about to accept quote <strong>{quote_id}</strong> and confirm your safari booking. Are you sure?',
+        'Yes, Accept This Quote', '#1B2A47', '&#x1F389;')
 
-    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
-        'status': 'accepted'
-    })
 
-    trigger_make_webhook(MAKE_S2_WEBHOOK, {
-        'event': 'quote_accepted',
-        'quote_number': quote_id,
-        'accepted_at': int(time.time()),
-    })
-
+@app.route('/client-accept-confirm', methods=['POST'])
+def client_accept_confirm():
+    token = request.form.get('token', '')
+    quote_id = verify_token(token, 'client-accept')
+    if not quote_id:
+        return invalid_page()
+    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {'status': 'accepted'})
+    trigger_make_webhook(MAKE_S2_WEBHOOK, {'event': 'quote_accepted', 'quote_number': quote_id, 'accepted_at': int(time.time())})
     logger.info(f"Quote accepted by client: {quote_id}")
-
-    return '''<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#f9f9f9">
-        <div style="max-width:500px;margin:0 auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1)">
-            <div style="font-size:48px;margin-bottom:16px">&#x1F389;</div>
-            <h2 style="color:#1B2A47;margin-bottom:8px">Quote Accepted!</h2>
-            <p style="color:#666">Thank you! Your safari booking is confirmed. Your travel specialist will be in touch shortly with payment details.</p>
-            <p style="color:#C4922A;font-weight:bold;font-size:14px">''' + quote_id + '''</p>
-        </div>
-    </body></html>'''
+    return success_page('&#x1F389;', 'Quote Accepted!', 'Thank you! Your safari booking is confirmed. Your travel specialist will be in touch shortly with payment details.', quote_id)
 
 
-# ─── Client Changes endpoint ──────────────────────────────────────────────────
+# ─── Client Changes ───────────────────────────────────────────────────────────
 @app.route('/client-changes', methods=['GET'])
 def client_changes():
     token = request.args.get('token', '')
     quote_id = verify_token(token, 'client-changes')
-
     if not quote_id:
-        return '''<html><body style="font-family:sans-serif;text-align:center;padding:60px">
-            <h2 style="color:#c0392b">Invalid or Expired Link</h2>
-            <p>This link is invalid or has expired.</p>
-        </body></html>''', 400
+        return invalid_page()
+    return confirmation_page(token, 'client-changes',
+        'Request Changes',
+        f'You are about to request changes to quote <strong>{quote_id}</strong>. Your travel specialist will be notified. Are you sure?',
+        'Yes, Request Changes', '#C4922A', '&#x270F;&#xFE0F;')
 
-    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
-        'status': 'revision_requested'
-    })
 
-    trigger_make_webhook(MAKE_S2_WEBHOOK, {
-        'event': 'client_changes_requested',
-        'quote_number': quote_id,
-        'requested_at': int(time.time()),
-    })
-
+@app.route('/client-changes-confirm', methods=['POST'])
+def client_changes_confirm():
+    token = request.form.get('token', '')
+    quote_id = verify_token(token, 'client-changes')
+    if not quote_id:
+        return invalid_page()
+    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {'status': 'revision_requested'})
+    trigger_make_webhook(MAKE_S2_WEBHOOK, {'event': 'client_changes_requested', 'quote_number': quote_id, 'requested_at': int(time.time())})
     logger.info(f"Client requested changes: {quote_id}")
-
-    return '''<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#f9f9f9">
-        <div style="max-width:500px;margin:0 auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1)">
-            <div style="font-size:48px;margin-bottom:16px">&#x270F;&#xFE0F;</div>
-            <h2 style="color:#1B2A47;margin-bottom:8px">Changes Requested</h2>
-            <p style="color:#666">Your request has been received. Your travel specialist will review your feedback and send you an updated quote shortly.</p>
-            <p style="color:#C4922A;font-weight:bold;font-size:14px">''' + quote_id + '''</p>
-        </div>
-    </body></html>'''
+    return success_page('&#x270F;&#xFE0F;', 'Changes Requested', 'Your request has been received. Your travel specialist will review your feedback and send you an updated quote shortly.', quote_id)
 
 
 if __name__ == '__main__':
