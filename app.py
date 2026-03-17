@@ -33,7 +33,7 @@ API_BASE_URL        = os.environ.get('API_BASE_URL', 'https://travel-quote-api.o
 PORTAL_URL          = os.environ.get('PORTAL_URL', 'https://safariflow-portal.netlify.app')
 STORAGE_BUCKET      = 'quote-pdfs'
 OUTPUT_DIR          = os.path.join(os.path.dirname(__file__), 'outputs')
-TOKEN_EXPIRY_DAYS   = 14
+TOKEN_EXPIRY_DAYS   = 7
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
