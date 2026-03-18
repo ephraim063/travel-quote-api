@@ -29,11 +29,14 @@ SUPABASE_KEY        = os.environ.get('SUPABASE_SERVICE_KEY', '')
 ANTHROPIC_API_KEY   = os.environ.get('ANTHROPIC_API_KEY', '')
 APPROVAL_SECRET     = os.environ.get('APPROVAL_SECRET', 'safariflow-secret-change-me')
 MAKE_S2_WEBHOOK     = os.environ.get('MAKE_SCENARIO2_WEBHOOK', '')
-API_BASE_URL        = os.environ.get('API_BASE_URL', 'https://travel-quote-api.onrender.com')
+MAKE_S3_WEBHOOK     = os.environ.get('MAKE_SCENARIO3_WEBHOOK', '')
+API_BASE_URL        = os.environ.get('API_BASE_URL', 'https://web-production-4788f.up.railway.app')
 PORTAL_URL          = os.environ.get('PORTAL_URL', 'https://safariflow-portal.netlify.app')
+RESEND_API_KEY      = os.environ.get('RESEND_API_KEY', '')
+RESEND_FROM         = os.environ.get('RESEND_FROM', 'SafariFlow <onboarding@resend.dev>')
 STORAGE_BUCKET      = 'quote-pdfs'
 OUTPUT_DIR          = os.path.join(os.path.dirname(__file__), 'outputs')
-TOKEN_EXPIRY_DAYS   = 14
+TOKEN_EXPIRY_DAYS   = 7
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -161,6 +164,164 @@ def trigger_make_webhook(webhook_url, payload):
     except Exception as e:
         logger.error(f"Make webhook error: {str(e)}")
         return False
+
+
+# ─── Resend email helper ──────────────────────────────────────────────────────
+def send_email(to, subject, html, attachments=None):
+    """Send email via Resend API."""
+    if not RESEND_API_KEY:
+        logger.warning("Resend API key not set — skipping email")
+        return False
+    try:
+        payload = {
+            'from': RESEND_FROM,
+            'to': [to] if isinstance(to, str) else to,
+            'subject': subject,
+            'html': html,
+        }
+        if attachments:
+            payload['attachments'] = attachments
+
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
+            'https://api.resend.com/emails',
+            data=data, method='POST',
+            headers={
+                'Authorization': f'Bearer {RESEND_API_KEY}',
+                'Content-Type': 'application/json',
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read().decode())
+            logger.info(f"Email sent via Resend: {result.get('id')}")
+        return True
+    except urllib.error.HTTPError as e:
+        logger.error(f"Resend error: {e.code} {e.read().decode()}")
+        return False
+    except Exception as e:
+        logger.error(f"Resend error: {str(e)}")
+        return False
+
+
+def agent_approval_email_html(agent_name, agency_name, client_name, quote_number,
+                               start_date, end_date, total_price,
+                               approve_url, reject_url,
+                               brand_primary='#2E4A7A', brand_secondary='#C4922A'):
+    """Build agent approval email HTML."""
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f4;">
+<table width="100%" cellpadding="0" cellspacing="0">
+<tr><td align="center" style="padding:30px 0;">
+<table width="600" cellpadding="0" cellspacing="0" style="background:white;border-radius:8px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.1);">
+<tr><td style="background-color:{brand_primary};padding:30px;text-align:center;">
+  <h1 style="margin:0;color:#FFFFFF;font-size:22px;letter-spacing:2px;">{agency_name}</h1>
+  <p style="margin:6px 0 0;color:#FFFFFF;font-size:12px;letter-spacing:1px;">NEW QUOTE READY FOR REVIEW</p>
+</td></tr>
+<tr><td style="background-color:{brand_secondary};height:3px;"></td></tr>
+<tr><td style="padding:36px 40px;background:#ffffff;">
+  <p style="color:#1A1A1A;font-size:16px;margin:0 0 8px;">Hello <strong>{agent_name}</strong>, a new safari quote has been generated and is ready for your review.</p>
+  <table width="100%" cellpadding="12" style="background:#F5F0E8;border-radius:6px;margin:16px 0;">
+    <tr>
+      <td style="color:#444444;font-size:11px;letter-spacing:1px;font-weight:bold;">CLIENT</td>
+      <td style="color:#444444;font-size:11px;letter-spacing:1px;font-weight:bold;">QUOTE NUMBER</td>
+    </tr>
+    <tr>
+      <td style="color:#1A1A1A;font-size:14px;font-weight:bold;">{client_name}</td>
+      <td style="color:#1A1A1A;font-size:14px;font-weight:bold;">{quote_number}</td>
+    </tr>
+    <tr>
+      <td style="color:#444444;font-size:11px;letter-spacing:1px;font-weight:bold;padding-top:8px;">TRAVEL DATES</td>
+      <td style="color:#444444;font-size:11px;letter-spacing:1px;font-weight:bold;padding-top:8px;">TOTAL VALUE</td>
+    </tr>
+    <tr>
+      <td style="color:#1A1A1A;font-size:14px;font-weight:bold;">{start_date} — {end_date}</td>
+      <td style="color:#1A1A1A;font-size:14px;font-weight:bold;">${total_price:,.0f}</td>
+    </tr>
+  </table>
+  <table width="100%" cellpadding="0" cellspacing="0" style="margin:16px 0 8px;">
+    <tr><td align="center">
+      <a href="{approve_url}" style="display:inline-block;background-color:{brand_primary};color:#FFFFFF;padding:16px 32px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:14px;letter-spacing:1px;">
+        ✅ APPROVE &amp; SEND TO CLIENT
+      </a>
+    </td></tr>
+  </table>
+  <table width="100%" cellpadding="0" cellspacing="0" style="margin:8px 0 16px;">
+    <tr><td align="center">
+      <a href="{reject_url}" style="display:inline-block;background-color:{brand_secondary};color:#FFFFFF;padding:16px 32px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:14px;letter-spacing:1px;">
+        ✏️ MAKE CHANGES
+      </a>
+    </td></tr>
+  </table>
+  <table width="100%" cellpadding="10" style="background:#FFF5F5;border-radius:6px;border:1px solid #F5CCCC;margin-bottom:16px;">
+    <tr><td style="color:#B03030;font-size:13px;font-weight:bold;text-align:center;">⚠ THESE LINKS WILL EXPIRE IN 7 DAYS</td></tr>
+  </table>
+  <p style="color:#1A1A1A;font-size:14px;margin:0;">This quote was generated automatically by SafariFlow.</p>
+</td></tr>
+<tr><td style="background:#F5F0E8;padding:20px 40px;text-align:center;">
+  <p style="margin:0;color:#444444;font-size:12px;">{agency_name} · Powered by SafariFlow</p>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body></html>"""
+
+
+def client_quote_email_html(client_name, agency_name, agent_name, agent_email, agent_phone,
+                             quote_number, start_date, end_date,
+                             accept_url, changes_url,
+                             brand_primary='#2E4A7A', brand_secondary='#C4922A'):
+    """Build client quote email HTML."""
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f4;">
+<table width="100%" cellpadding="0" cellspacing="0">
+<tr><td align="center" style="padding:30px 0;">
+<table width="600" cellpadding="0" cellspacing="0" style="background:white;border-radius:8px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.1);">
+<tr><td style="background-color:{brand_primary};padding:30px;text-align:center;">
+  <h1 style="margin:0;color:#FFFFFF;font-size:22px;letter-spacing:2px;">{agency_name}</h1>
+  <p style="margin:6px 0 0;color:#FFFFFF;font-size:12px;letter-spacing:1px;">TRAVEL &amp; SAFARI SPECIALISTS</p>
+</td></tr>
+<tr><td style="background-color:{brand_secondary};height:3px;"></td></tr>
+<tr><td style="padding:36px 40px;background:#ffffff;">
+  <p style="color:#1A1A1A;font-size:16px;margin:0 0 8px;">Dear <strong>{client_name}</strong>, your personalised safari quote is ready for review.</p>
+  <table width="100%" cellpadding="12" style="background:#F5F0E8;border-radius:6px;margin:16px 0;">
+    <tr>
+      <td style="color:#444444;font-size:11px;letter-spacing:1px;font-weight:bold;">QUOTE NUMBER</td>
+      <td style="color:#444444;font-size:11px;letter-spacing:1px;font-weight:bold;">TRAVEL DATES</td>
+    </tr>
+    <tr>
+      <td style="color:#1A1A1A;font-size:14px;font-weight:bold;">{quote_number}</td>
+      <td style="color:#1A1A1A;font-size:14px;font-weight:bold;">{start_date} — {end_date}</td>
+    </tr>
+  </table>
+  <p style="color:#1A1A1A;font-size:15px;text-align:center;">Please review the attached PDF and let us know your decision.</p>
+  <table width="100%" cellpadding="0" cellspacing="0" style="margin:16px 0 8px;">
+    <tr><td align="center">
+      <a href="{accept_url}" style="display:inline-block;background-color:{brand_primary};color:#FFFFFF;padding:16px 32px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:14px;letter-spacing:1px;">
+        TAP THIS LINK TO ACCEPT THIS QUOTE
+      </a>
+    </td></tr>
+  </table>
+  <table width="100%" cellpadding="0" cellspacing="0" style="margin:8px 0 16px;">
+    <tr><td align="center">
+      <a href="{changes_url}" style="display:inline-block;background-color:{brand_secondary};color:#FFFFFF;padding:16px 32px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:14px;letter-spacing:1px;">
+        TAP THIS LINK TO REQUEST CHANGES
+      </a>
+    </td></tr>
+  </table>
+  <table width="100%" cellpadding="10" style="background:#FFF5F5;border-radius:6px;border:1px solid #F5CCCC;margin-bottom:16px;">
+    <tr><td style="color:#B03030;font-size:13px;font-weight:bold;text-align:center;">⚠ THESE LINKS WILL EXPIRE IN 7 DAYS</td></tr>
+  </table>
+  <p style="color:#1A1A1A;font-size:15px;">We look forward to crafting your perfect safari experience.</p>
+</td></tr>
+<tr><td style="background:#F5F0E8;padding:20px 40px;text-align:center;">
+  <p style="margin:0;color:#444444;font-size:12px;">{agency_name} · {agent_email} · {agent_phone}</p>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body></html>"""
 
 
 # ─── Claude API helper ────────────────────────────────────────────────────────
@@ -327,6 +488,33 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
 
         logger.info(f"PDF complete: {filename} ({len(pdf_bytes)} bytes)")
 
+        # ── Send agent approval email via Resend ──────────────────────────────
+        agent_email_addr = agent.get('email', '')
+        if agent_email_addr:
+            email_html = agent_approval_email_html(
+                agent_name=agent.get('agent_name', 'Agent'),
+                agency_name=agent.get('agency_name', 'SafariFlow'),
+                client_name=client_name,
+                quote_number=quote_number,
+                start_date=start_date,
+                end_date=end_date,
+                total_price=total_price,
+                approve_url=approve_url,
+                reject_url=reject_url,
+                brand_primary=agent.get('brand_color_primary', '#2E4A7A'),
+                brand_secondary=agent.get('brand_color_secondary', '#C4922A'),
+            )
+            send_email(
+                to=agent_email_addr,
+                subject=f"New Quote Ready for Review — {client_name} ({quote_number})",
+                html=email_html,
+                attachments=[{
+                    'filename': filename,
+                    'content': pdf_base64,
+                }]
+            )
+            logger.info(f"Agent approval email sent to {agent_email_addr}")
+
         return jsonify({
             'success':        True,
             'filename':       filename,
@@ -426,10 +614,65 @@ def approve_confirm():
     quote_id = verify_token(token, 'approve')
     if not quote_id:
         return invalid_page()
+
+    # Update status
     supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {'status': 'sent'})
+
+    # Fetch quote and agent details to send client email
+    quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
+    if quotes:
+        quote = quotes[0]
+        agents = supabase_get('agents', {'id': f'eq.{quote.get("agent_id")}', 'select': '*'})
+        agent = agents[0] if agents else {}
+
+        client_email_addr = quote.get('client_email', '')
+        client_accept_token = generate_token(quote_id, 'client-accept')
+        client_changes_token = generate_token(quote_id, 'client-changes')
+        accept_url = f"{API_BASE_URL}/client-accept?token={client_accept_token}"
+        changes_url = f"{API_BASE_URL}/client-changes?token={client_changes_token}"
+
+        if client_email_addr:
+            # Fetch PDF from Supabase Storage
+            pdf_url = quote.get('pdf_url', '')
+            pdf_base64 = ''
+            if pdf_url:
+                try:
+                    req = urllib.request.Request(pdf_url, headers={'User-Agent': 'SafariFlow/5.0'})
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        pdf_base64 = base64.b64encode(resp.read()).decode('utf-8')
+                except Exception as e:
+                    logger.warning(f"Could not fetch PDF for attachment: {str(e)}")
+
+            email_html = client_quote_email_html(
+                client_name=quote.get('client_name', 'Dear Guest'),
+                agency_name=agent.get('agency_name', 'SafariFlow'),
+                agent_name=agent.get('agent_name', ''),
+                agent_email=agent.get('email', ''),
+                agent_phone=agent.get('phone', ''),
+                quote_number=quote_id,
+                start_date=str(quote.get('start_date', '')),
+                end_date=str(quote.get('end_date', '')),
+                accept_url=accept_url,
+                changes_url=changes_url,
+                brand_primary=agent.get('brand_color_primary', '#2E4A7A'),
+                brand_secondary=agent.get('brand_color_secondary', '#C4922A'),
+            )
+
+            attachments = []
+            if pdf_base64:
+                attachments = [{'filename': f'SafariFlow_Quote_{quote_id}.pdf', 'content': pdf_base64}]
+
+            send_email(
+                to=client_email_addr,
+                subject=f"Your Safari Quote is Ready — {quote_id}",
+                html=email_html,
+                attachments=attachments if attachments else None,
+            )
+            logger.info(f"Client quote email sent to {client_email_addr}")
+
     trigger_make_webhook(MAKE_S2_WEBHOOK, {'event': 'quote_approved', 'quote_number': quote_id, 'approved_at': int(time.time())})
     logger.info(f"Quote approved: {quote_id}")
-    return success_page('&#x2705;', 'Quote Approved', 'The quote has been approved and will be sent to the client shortly.', quote_id)
+    return success_page('&#x2705;', 'Quote Approved', 'The quote has been approved and sent to the client.', quote_id)
 
 
 # ─── Agent Reject ─────────────────────────────────────────────────────────────
