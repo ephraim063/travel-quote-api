@@ -432,10 +432,36 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
         itinerary  = itinerary_data.get('itinerary', [])
         line_items = itinerary_data.get('line_items', [])
         total_price= float(itinerary_data.get('total_price_usd', 0) or 0)
-        deposit    = float(itinerary_data.get('deposit_amount_usd', 0) or round(total_price * 0.30, 2))
-        balance    = float(itinerary_data.get('balance_amount_usd', 0) or round(total_price - deposit, 2))
 
-        logger.info(f"Itinerary built: {len(itinerary)} days, total ${total_price}")
+        # ── Apply agent markup ────────────────────────────────────────────────
+        markup_type = agent.get('markup_type', 'overall')
+        markup_overall = float(agent.get('markup_overall_pct', 0) or 0) / 100
+        markup_map = {
+            'accommodation': float(agent.get('markup_accommodation_pct', 0) or 0) / 100,
+            'transport':     float(agent.get('markup_transport_pct', 0) or 0) / 100,
+            'park_fee':      float(agent.get('markup_park_fees_pct', 0) or 0) / 100,
+            'activity':      float(agent.get('markup_activities_pct', 0) or 0) / 100,
+        }
+
+        marked_up_items = []
+        for item in line_items:
+            item = dict(item)
+            if markup_type == 'overall':
+                pct = markup_overall
+            else:
+                line_type = item.get('line_type', 'accommodation')
+                pct = markup_map.get(line_type, markup_overall)
+            if pct > 0:
+                item['unit_price'] = round(float(item.get('unit_price', 0)) * (1 + pct), 2)
+                item['total_price'] = round(float(item.get('total_price', 0)) * (1 + pct), 2)
+            marked_up_items.append(item)
+
+        line_items = marked_up_items
+        total_price = sum(float(i.get('total_price', 0)) for i in line_items)
+        deposit    = round(total_price * (float(agent.get('deposit_percentage', 30) or 30) / 100), 2)
+        balance    = round(total_price - deposit, 2)
+
+        logger.info(f"Itinerary built: {len(itinerary)} days, total ${total_price} (after markup)")
 
         first_name = client_name.split()[0] if client_name else "Dear Guest"
         intro_narrative = f"{first_name}, your {duration_days}-day safari across {destinations} has been carefully crafted to deliver an authentic East African experience. Every detail has been arranged to ensure your journey is seamless and unforgettable."
@@ -465,7 +491,7 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
             'changes_url':  '#',
             'inclusions':   '- All accommodation as specified\n- All meals as per itinerary\n- All game drives\n- Park and conservancy fees\n- Internal flights as specified\n- Airport transfers',
             'exclusions':   '- International flights\n- Travel insurance\n- Visa fees\n- Personal expenses\n- Gratuities',
-            'terms':        'This quote is valid for 14 days. A 30% deposit is required to confirm the booking. Balance due 60 days prior to departure.',
+            'terms':        agent.get('cancellation_terms') or 'This quote is valid for 14 days. A 30% deposit is required to confirm the booking. Balance due 60 days prior to departure.',
             'agent':        {'name': agent.get('agent_name', ''), 'email': agent.get('email', ''), 'phone': agent.get('phone', ''), 'agency': agent.get('agency_name', ''), 'logo_url': agent.get('logo_url', ''), 'website': agent.get('website', '')},
             'client':       {'name': client_name, 'email': client_email, 'phone': client_phone, 'pax_adults': str(pax_adults), 'pax_children': str(pax_children), 'nationality': client_nationality},
             'trip':         {'title': f"{duration_days}-Day {destinations} Safari", 'start_date': start_date, 'end_date': end_date, 'duration_nights': str(duration_days), 'destinations': destinations, 'travel_style': accommodation_tier.title()},
@@ -732,10 +758,131 @@ def client_changes():
     quote_id = verify_token(token, 'client-changes')
     if not quote_id:
         return invalid_page()
-    return confirmation_page(token, 'client-changes',
-        'Request Changes',
-        f'You are about to request changes to quote <strong>{quote_id}</strong>. Your travel specialist will be notified. Are you sure?',
-        'Yes, Request Changes', '#C4922A', '&#x270F;&#xFE0F;')
+
+    # Fetch quote details for context
+    quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
+    quote = quotes[0] if quotes else {}
+    agents = supabase_get('agents', {'id': f'eq.{quote.get("agent_id", "")}', 'select': '*'})
+    agent = agents[0] if agents else {}
+    brand_primary = agent.get('brand_color_primary', '#2E4A7A')
+    brand_secondary = agent.get('brand_color_secondary', '#C4922A')
+    agency_name = agent.get('agency_name', 'SafariFlow')
+
+    return f'''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Request Changes — {quote_id}</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; }}
+  .container {{ max-width: 560px; margin: 40px auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 16px rgba(0,0,0,0.1); }}
+  .header {{ background: {brand_primary}; padding: 28px; text-align: center; color: white; }}
+  .header h1 {{ font-size: 20px; letter-spacing: 2px; margin-bottom: 4px; }}
+  .header p {{ font-size: 12px; opacity: 0.8; }}
+  .gold-line {{ background: {brand_secondary}; height: 3px; }}
+  .body {{ padding: 32px; }}
+  .body h2 {{ font-size: 18px; color: #1A1A1A; margin-bottom: 6px; }}
+  .body .sub {{ font-size: 13px; color: #666; margin-bottom: 24px; }}
+  .section-label {{ font-size: 11px; font-weight: bold; letter-spacing: 1px; color: #999; text-transform: uppercase; margin-bottom: 10px; }}
+  .checkboxes {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }}
+  .checkbox-item {{ display: flex; align-items: center; gap: 8px; background: #F8F6F2; border: 1px solid #E8E4DE; border-radius: 8px; padding: 10px 12px; cursor: pointer; transition: all 0.2s; }}
+  .checkbox-item:hover {{ border-color: {brand_secondary}; }}
+  .checkbox-item input {{ accent-color: {brand_primary}; width: 16px; height: 16px; cursor: pointer; }}
+  .checkbox-item label {{ font-size: 13px; color: #1A1A1A; cursor: pointer; }}
+  .budget-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }}
+  .form-group {{ margin-bottom: 16px; }}
+  .form-group label {{ display: block; font-size: 12px; font-weight: bold; color: #666; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }}
+  .form-group input, .form-group textarea, .form-group select {{ width: 100%; padding: 10px 12px; border: 1px solid #E8E4DE; border-radius: 8px; font-size: 13px; font-family: Arial, sans-serif; outline: none; transition: border 0.2s; }}
+  .form-group input:focus, .form-group textarea:focus {{ border-color: {brand_primary}; }}
+  .form-group textarea {{ min-height: 90px; resize: vertical; }}
+  .submit-btn {{ width: 100%; background: {brand_primary}; color: white; border: none; padding: 14px; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer; letter-spacing: 1px; margin-top: 8px; }}
+  .submit-btn:hover {{ opacity: 0.9; }}
+  .quote-ref {{ background: #F8F6F2; border-radius: 8px; padding: 12px 16px; margin-bottom: 24px; font-size: 13px; color: #666; }}
+  .quote-ref span {{ color: {brand_secondary}; font-weight: bold; font-family: monospace; }}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>{agency_name}</h1>
+    <p>REQUEST CHANGES TO YOUR QUOTE</p>
+  </div>
+  <div class="gold-line"></div>
+  <div class="body">
+    <h2>What would you like changed?</h2>
+    <p class="sub">Please tell us what you'd like us to adjust. We'll revise your quote and send it back to you.</p>
+
+    <div class="quote-ref">Quote Reference: <span>{quote_id}</span></div>
+
+    <form method="POST" action="/client-changes-confirm">
+      <input type="hidden" name="token" value="{token}">
+
+      <div class="section-label">What needs changing?</div>
+      <div class="checkboxes">
+        <div class="checkbox-item">
+          <input type="checkbox" id="c1" name="change_accommodation" value="yes">
+          <label for="c1">🏨 Accommodation</label>
+        </div>
+        <div class="checkbox-item">
+          <input type="checkbox" id="c2" name="change_dates" value="yes">
+          <label for="c2">📅 Travel Dates</label>
+        </div>
+        <div class="checkbox-item">
+          <input type="checkbox" id="c3" name="change_budget" value="yes">
+          <label for="c3">💰 Budget</label>
+        </div>
+        <div class="checkbox-item">
+          <input type="checkbox" id="c4" name="change_destinations" value="yes">
+          <label for="c4">📍 Destinations</label>
+        </div>
+        <div class="checkbox-item">
+          <input type="checkbox" id="c5" name="change_travelers" value="yes">
+          <label for="c5">👥 No. of Travelers</label>
+        </div>
+        <div class="checkbox-item">
+          <input type="checkbox" id="c6" name="change_transport" value="yes">
+          <label for="c6">✈️ Transport</label>
+        </div>
+        <div class="checkbox-item">
+          <input type="checkbox" id="c7" name="change_duration" value="yes">
+          <label for="c7">🌙 Trip Duration</label>
+        </div>
+        <div class="checkbox-item">
+          <input type="checkbox" id="c8" name="change_other" value="yes">
+          <label for="c8">✏️ Other</label>
+        </div>
+      </div>
+
+      <div class="budget-row">
+        <div class="form-group">
+          <label>Revised Budget (USD)</label>
+          <input type="number" name="revised_budget" placeholder="e.g. 8000">
+        </div>
+        <div class="form-group">
+          <label>Preferred Travel Month</label>
+          <select name="preferred_month">
+            <option value="">— No change —</option>
+            <option>January</option><option>February</option><option>March</option>
+            <option>April</option><option>May</option><option>June</option>
+            <option>July</option><option>August</option><option>September</option>
+            <option>October</option><option>November</option><option>December</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>Additional Notes</label>
+        <textarea name="notes" placeholder="Please describe the specific changes you would like..."></textarea>
+      </div>
+
+      <button type="submit" class="submit-btn">✏️ SUBMIT CHANGE REQUEST</button>
+    </form>
+  </div>
+</div>
+</body>
+</html>'''
 
 
 @app.route('/client-changes-confirm', methods=['POST'])
@@ -744,10 +891,54 @@ def client_changes_confirm():
     quote_id = verify_token(token, 'client-changes')
     if not quote_id:
         return invalid_page()
-    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {'status': 'revision_requested'})
-    trigger_make_webhook(MAKE_S2_WEBHOOK, {'event': 'client_changes_requested', 'quote_number': quote_id, 'requested_at': int(time.time())})
-    logger.info(f"Client requested changes: {quote_id}")
-    return success_page('&#x270F;&#xFE0F;', 'Changes Requested', 'Your request has been received. Your travel specialist will review your feedback and send you an updated quote shortly.', quote_id)
+
+    # Capture all change request details
+    change_request = {
+        'accommodation': request.form.get('change_accommodation') == 'yes',
+        'dates':         request.form.get('change_dates') == 'yes',
+        'budget':        request.form.get('change_budget') == 'yes',
+        'destinations':  request.form.get('change_destinations') == 'yes',
+        'travelers':     request.form.get('change_travelers') == 'yes',
+        'transport':     request.form.get('change_transport') == 'yes',
+        'duration':      request.form.get('change_duration') == 'yes',
+        'other':         request.form.get('change_other') == 'yes',
+        'revised_budget':   request.form.get('revised_budget', ''),
+        'preferred_month':  request.form.get('preferred_month', ''),
+        'notes':            request.form.get('notes', ''),
+    }
+
+    # Build human-readable summary for agent notification
+    changes_list = []
+    if change_request['accommodation']: changes_list.append('Accommodation')
+    if change_request['dates']:         changes_list.append('Travel Dates')
+    if change_request['budget']:        changes_list.append('Budget')
+    if change_request['destinations']:  changes_list.append('Destinations')
+    if change_request['travelers']:     changes_list.append('Number of Travelers')
+    if change_request['transport']:     changes_list.append('Transport')
+    if change_request['duration']:      changes_list.append('Trip Duration')
+    if change_request['other']:         changes_list.append('Other')
+
+    # Update quote status and save change request
+    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
+        'status': 'revision_requested',
+        'change_request': json.dumps(change_request),
+    })
+
+    # Trigger Scenario 3 — AI Revision Pipeline
+    trigger_make_webhook(MAKE_S3_WEBHOOK, {
+        'event':            'client_changes_requested',
+        'quote_number':     quote_id,
+        'changes_requested': changes_list,
+        'revised_budget':   change_request['revised_budget'],
+        'preferred_month':  change_request['preferred_month'],
+        'notes':            change_request['notes'],
+        'requested_at':     int(time.time()),
+    })
+
+    logger.info(f"Client requested changes for {quote_id}: {changes_list}")
+    return success_page('✏️', 'Changes Received!',
+        f'Thank you! We have received your change request. Our team will revise your quote and send you an updated version shortly.',
+        quote_id)
 
 
 if __name__ == '__main__':
