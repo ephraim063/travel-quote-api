@@ -34,6 +34,7 @@ API_BASE_URL        = os.environ.get('API_BASE_URL', 'https://web-production-478
 PORTAL_URL          = os.environ.get('PORTAL_URL', 'https://safariflow-portal.netlify.app')
 RESEND_API_KEY      = os.environ.get('RESEND_API_KEY', '')
 RESEND_FROM         = os.environ.get('RESEND_FROM', 'SafariFlow <onboarding@resend.dev>')
+UNSPLASH_ACCESS_KEY = os.environ.get('UNSPLASH_ACCESS_KEY', '')
 STORAGE_BUCKET      = 'quote-pdfs'
 OUTPUT_DIR          = os.path.join(os.path.dirname(__file__), 'outputs')
 TOKEN_EXPIRY_DAYS   = 7
@@ -358,6 +359,73 @@ def call_claude(prompt, max_tokens=4000):
         return {}
 
 
+# ─── Unsplash photo fetcher ───────────────────────────────────────────────────
+def fetch_unsplash_photo(query, width=800, height=500):
+    """Fetch a single photo from Unsplash for a given query. Returns image bytes or None."""
+    if not UNSPLASH_ACCESS_KEY:
+        return None
+    try:
+        safe_query = urllib.parse.quote(query)
+        url = f"https://api.unsplash.com/search/photos?query={safe_query}&per_page=1&orientation=landscape&client_id={UNSPLASH_ACCESS_KEY}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'SafariFlow/1.0'})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        results = data.get('results', [])
+        if not results:
+            return None
+        photo_url = results[0].get('urls', {}).get('regular', '')
+        if not photo_url:
+            return None
+        # Download the actual image
+        img_req = urllib.request.Request(photo_url, headers={'User-Agent': 'SafariFlow/1.0'})
+        with urllib.request.urlopen(img_req, timeout=10) as img_resp:
+            return img_resp.read()
+    except Exception as e:
+        logger.warning(f"Unsplash fetch failed for '{query}': {str(e)}")
+        return None
+
+
+def fetch_photos_for_itinerary(itinerary):
+    """Fetch photos for all itinerary days in parallel. Returns photo_cache dict."""
+    if not UNSPLASH_ACCESS_KEY:
+        logger.info("Unsplash key not set — skipping photos")
+        return {}
+
+    import threading
+
+    photo_cache = {}
+    lock = threading.Lock()
+
+    # Deduplicate queries to avoid redundant API calls
+    queries = {}
+    for day in itinerary:
+        query = day.get('image_search_query') or f"{day.get('destination', '')} safari wildlife Kenya"
+        day_num = day.get('day_number', 0)
+        queries[day_num] = query
+
+    def fetch_one(day_num, query):
+        img_bytes = fetch_unsplash_photo(query)
+        if img_bytes:
+            with lock:
+                photo_cache[str(day_num)] = img_bytes
+            logger.info(f"Photo fetched for day {day_num}: {query}")
+        else:
+            logger.warning(f"No photo for day {day_num}: {query}")
+
+    threads = []
+    for day_num, query in queries.items():
+        t = threading.Thread(target=fetch_one, args=(day_num, query))
+        t.start()
+        threads.append(t)
+
+    # Wait max 20 seconds for all photos
+    for t in threads:
+        t.join(timeout=20)
+
+    logger.info(f"Photos fetched: {len(photo_cache)}/{len(queries)} days")
+    return photo_cache
+
+
 # ─── Routes ───────────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
@@ -484,6 +552,9 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
 
         reviews_formatted = [{'review_text': r.get('review_text', ''), 'client_name': r.get('client_name', ''), 'client_origin': r.get('client_origin', ''), 'trip_summary': r.get('trip_summary', '')} for r in reviews]
 
+        logger.info("Fetching destination photos from Unsplash...")
+        photo_cache = fetch_photos_for_itinerary(itinerary)
+
         pdf_data = {
             'quote_id':     quote_number,
             'generated_at': start_date[:10] if start_date else '',
@@ -497,7 +568,7 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
             'trip':         {'title': f"{duration_days}-Day {destinations} Safari", 'start_date': start_date, 'end_date': end_date, 'duration_nights': str(duration_days), 'destinations': destinations, 'travel_style': accommodation_tier.title()},
             'itinerary':    itinerary,
             'line_items':   line_items,
-            'photo_cache':  {},
+            'photo_cache':  photo_cache,
             'pricing':      {'total_price_usd': total_price, 'deposit_amount_usd': deposit, 'balance_amount_usd': balance, 'within_budget': itinerary_data.get('within_budget', True), 'budget_notes': itinerary_data.get('budget_notes', '')},
             'narrative':    {'intro': intro_narrative, 'days': narrative_days},
             'agent_profile':{'tagline': profile.get('tagline', 'Travel & Safari Specialists'), 'bio': profile.get('bio', ''), 'years_experience': profile.get('years_experience', ''), 'safaris_planned': profile.get('safaris_planned', ''), 'countries_covered': profile.get('countries_covered', ''), 'awards': profile.get('awards', []), 'memberships': profile.get('memberships', []), 'address': profile.get('address', ''), 'facebook': profile.get('facebook', ''), 'instagram': profile.get('instagram', ''), 'linkedin': profile.get('linkedin', '')},
@@ -936,9 +1007,233 @@ def client_changes_confirm():
     })
 
     logger.info(f"Client requested changes for {quote_id}: {changes_list}")
+
+    # ── Send agent notification email via Resend ──────────────────────────────
+    quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
+    if quotes:
+        quote = quotes[0]
+        agents = supabase_get('agents', {'id': f'eq.{quote.get("agent_id")}', 'select': '*'})
+        agent = agents[0] if agents else {}
+        agent_email_addr = agent.get('email', '')
+        if agent_email_addr:
+            brand_primary = agent.get('brand_color_primary', '#2E4A7A')
+            brand_secondary = agent.get('brand_color_secondary', '#C4922A')
+            agency_name = agent.get('agency_name', 'SafariFlow')
+            agent_name = agent.get('agent_name', 'Agent')
+            portal_link = f"{PORTAL_URL}/quotes/review/{quote_id}"
+            changes_html = ''.join([f'<li style="margin-bottom:6px;color:#1A1A1A;font-size:13px;">{c}</li>' for c in changes_list])
+            budget_line = f'<p style="margin:12px 0;font-size:13px;color:#1A1A1A;"><strong>Revised budget:</strong> ${float(change_request["revised_budget"]):,.0f}</p>' if change_request.get('revised_budget') else ''
+            notes_line = f'<div style="background:#F8F6F2;border-radius:8px;padding:12px 14px;margin:12px 0;font-size:13px;color:#444;">💬 {change_request["notes"]}</div>' if change_request.get('notes') else ''
+
+            revision_email_html = f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f4;">
+<table width="100%" cellpadding="0" cellspacing="0">
+<tr><td align="center" style="padding:30px 0;">
+<table width="600" cellpadding="0" cellspacing="0" style="background:white;border-radius:8px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.1);">
+<tr><td style="background-color:{brand_primary};padding:30px;text-align:center;">
+  <h1 style="margin:0;color:#FFFFFF;font-size:22px;letter-spacing:2px;">{agency_name}</h1>
+  <p style="margin:6px 0 0;color:#FFFFFF;font-size:12px;letter-spacing:1px;">CLIENT CHANGE REQUEST</p>
+</td></tr>
+<tr><td style="background-color:{brand_secondary};height:3px;"></td></tr>
+<tr><td style="padding:36px 40px;background:#ffffff;">
+  <p style="color:#1A1A1A;font-size:16px;margin:0 0 16px;">Hello <strong>{agent_name}</strong>, your client has requested changes to quote <strong>{quote_id}</strong>.</p>
+  <div style="background:#FFF8F0;border:1px solid #F5DFB0;border-radius:8px;padding:16px 20px;margin-bottom:20px;">
+    <p style="font-size:12px;font-weight:bold;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;">Changes Requested:</p>
+    <ul style="margin:0;padding-left:18px;">{changes_html}</ul>
+    {budget_line}
+    {notes_line}
+  </div>
+  <p style="color:#1A1A1A;font-size:14px;margin-bottom:20px;">The AI has been notified and will rebuild the quote automatically. Click below to review and approve the revised quote before sending to the client.</p>
+  <table width="100%" cellpadding="0" cellspacing="0" style="margin:16px 0;">
+    <tr><td align="center">
+      <a href="{portal_link}" style="display:inline-block;background-color:{brand_primary};color:#FFFFFF;padding:16px 32px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:14px;letter-spacing:1px;">
+        🔍 REVIEW REVISED QUOTE
+      </a>
+    </td></tr>
+  </table>
+  <p style="color:#1A1A1A;font-size:13px;margin:0;">Quote reference: <strong>{quote_id}</strong></p>
+</td></tr>
+<tr><td style="background:#F5F0E8;padding:20px 40px;text-align:center;">
+  <p style="margin:0;color:#444444;font-size:12px;">{agency_name} · Powered by SafariFlow</p>
+</td></tr>
+</table>
+</td></tr>
+</table>
+</body></html>"""
+
+            send_email(
+                to=agent_email_addr,
+                subject=f"Client Requested Changes — {quote_id}",
+                html=revision_email_html,
+            )
+            logger.info(f"Revision notification sent to {agent_email_addr}")
+
     return success_page('✏️', 'Changes Received!',
-        f'Thank you! We have received your change request. Our team will revise your quote and send you an updated version shortly.',
+        'Thank you! We have received your change request. Our team will revise your quote and send you an updated version shortly.',
         quote_id)
+
+
+# ─── Package Safari PDF ───────────────────────────────────────────────────────
+@app.route('/generate-package-pdf', methods=['POST'])
+def generate_package_pdf():
+    """Stream 2 — Generate PDF from a pre-built package."""
+    try:
+        data = request.get_json(force=True)
+        agent_id        = data.get('agent_id', '')
+        package_id      = data.get('package_id', '')
+        client_name     = data.get('client_name', '')
+        client_email    = data.get('client_email', '')
+        client_phone    = data.get('client_phone', '')
+        client_nationality = data.get('client_nationality', '')
+        start_date      = data.get('start_date', '')
+        end_date        = data.get('end_date', '')
+        pax_adults      = int(data.get('pax_adults', 2))
+        pax_children    = int(data.get('pax_children', 0))
+        special_requests = data.get('special_requests', [])
+        request_id      = data.get('request_id', str(uuid.uuid4())[:8])
+
+        logger.info(f"Package PDF request: agent={agent_id}, package={package_id}, client={client_name}")
+
+        # Fetch agent
+        agents = supabase_get('agents', {'id': f'eq.{agent_id}', 'select': '*'})
+        if not agents:
+            return jsonify({'error': 'Agent not found'}), 404
+        agent = agents[0]
+
+        # Fetch package from Supabase
+        packages = supabase_get('packages', {'id': f'eq.{package_id}', 'select': '*'})
+        if not packages:
+            return jsonify({'error': 'Package not found'}), 404
+        pkg = packages[0]
+
+        # Calculate pricing with markup
+        base_price = float(pkg.get('base_price_usd_cents', 0)) / 100
+        markup_type = agent.get('markup_type', 'overall')
+        markup_pct = float(agent.get('markup_overall_pct', 0) or 0) / 100
+        if markup_type == 'per_category':
+            markup_pct = float(agent.get('markup_accommodation_pct', 0) or 0) / 100
+        total_per_person = round(base_price * (1 + markup_pct), 2)
+        total_price = round(total_per_person * pax_adults, 2)
+        deposit_pct = float(agent.get('deposit_percentage', 30) or 30) / 100
+        deposit = round(total_price * deposit_pct, 2)
+        balance = round(total_price - deposit, 2)
+
+        duration_days = pkg.get('duration_days', 7)
+        destinations = pkg.get('destination', '')
+
+        # Build itinerary from package days
+        pkg_itinerary = pkg.get('itinerary_days', [])
+        if not pkg_itinerary:
+            pkg_itinerary = [{'day_number': i+1, 'destination': destinations, 'title': f'Day {i+1}', 'accommodation_name': pkg.get('accommodation_name', ''), 'room_type': 'Standard Room', 'meal_plan': 'Full Board', 'nights': 1, 'transport_description': None, 'image_search_query': f'{destinations} safari wildlife'} for i in range(duration_days)]
+
+        # Line items
+        line_items = [
+            {'line_type': 'accommodation', 'description': pkg.get('name', ''), 'details': f'{duration_days} nights · {destinations}', 'quantity': pax_adults, 'unit_price': total_per_person, 'total_price': total_price},
+        ]
+
+        # Personalise narrative with Claude
+        narrative_prompt = f"""Write a warm, professional safari introduction for {client_name} who has booked the {pkg.get('name', '')} package.
+Duration: {duration_days} days in {destinations}.
+Special requests: {', '.join(special_requests) if special_requests else 'None'}.
+Keep it to 3 sentences, personal and evocative. Return only the narrative text, no JSON."""
+
+        try:
+            narrative_result = call_claude(narrative_prompt, max_tokens=300)
+            intro_narrative = narrative_result if isinstance(narrative_result, str) else f"{client_name.split()[0]}, your {duration_days}-day safari awaits. Every detail of your {pkg.get('name', '')} experience has been expertly arranged for an unforgettable journey."
+        except Exception:
+            intro_narrative = f"{client_name.split()[0]}, your {duration_days}-day safari awaits. Every detail of your {pkg.get('name', '')} experience has been expertly arranged for an unforgettable journey."
+
+        narrative_days = [{'day_number': d.get('day_number'), 'narrative': d.get('narrative', f"Today you explore {d.get('destination', destinations)} with your expert guide."), 'highlight': d.get('highlight', f"Wildlife encounters in {d.get('destination', destinations)}"), 'accommodation_description': f"{d.get('accommodation_name', '')}, {d.get('room_type', 'Standard Room')} — your comfortable base."} for d in pkg_itinerary]
+
+        # Tokens
+        quote_number         = f"QT-PKG-{request_id}"
+        approve_token        = generate_token(quote_number, 'approve')
+        reject_token         = generate_token(quote_number, 'reject')
+        client_accept_token  = generate_token(quote_number, 'client-accept')
+        client_changes_token = generate_token(quote_number, 'client-changes')
+        approve_url          = f"{API_BASE_URL}/approve?token={approve_token}"
+        reject_url           = f"{API_BASE_URL}/reject?token={reject_token}"
+        client_accept_url    = f"{API_BASE_URL}/client-accept?token={client_accept_token}"
+        client_changes_url   = f"{API_BASE_URL}/client-changes?token={client_changes_token}"
+
+        # Fetch photos
+        photo_cache = fetch_photos_for_itinerary(pkg_itinerary)
+
+        filename    = f"SafariFlow_Package_{quote_number}.pdf"
+        output_path = os.path.join(OUTPUT_DIR, filename)
+
+        pdf_data = {
+            'quote_id':     quote_number,
+            'generated_at': start_date[:10] if start_date else '',
+            'accept_url':   '#', 'changes_url': '#',
+            'inclusions':   pkg.get('inclusions', '- All accommodation as specified\n- All meals as per itinerary\n- All game drives\n- Park fees'),
+            'exclusions':   pkg.get('exclusions', '- International flights\n- Travel insurance\n- Personal expenses'),
+            'terms':        agent.get('cancellation_terms') or 'This quote is valid for 14 days. A 30% deposit is required to confirm the booking.',
+            'agent':        {'name': agent.get('agent_name', ''), 'email': agent.get('email', ''), 'phone': agent.get('phone', ''), 'agency': agent.get('agency_name', ''), 'logo_url': agent.get('logo_url', ''), 'website': agent.get('website', '')},
+            'client':       {'name': client_name, 'email': client_email, 'phone': client_phone, 'pax_adults': str(pax_adults), 'pax_children': str(pax_children), 'nationality': client_nationality},
+            'trip':         {'title': pkg.get('name', ''), 'start_date': start_date, 'end_date': end_date, 'duration_nights': str(duration_days), 'destinations': destinations, 'travel_style': pkg.get('category', 'Safari')},
+            'itinerary':    pkg_itinerary,
+            'line_items':   line_items,
+            'photo_cache':  photo_cache,
+            'pricing':      {'total_price_usd': total_price, 'deposit_amount_usd': deposit, 'balance_amount_usd': balance, 'within_budget': True, 'budget_notes': ''},
+            'narrative':    {'intro': intro_narrative, 'days': narrative_days},
+            'agent_profile': {'tagline': 'Travel & Safari Specialists', 'bio': '', 'years_experience': '', 'safaris_planned': '', 'countries_covered': '', 'awards': [], 'memberships': [], 'address': '', 'facebook': '', 'instagram': '', 'linkedin': ''},
+            'agent_reviews': [],
+        }
+
+        generate_quote_pdf(pdf_data, output_path)
+        pdf_url = supabase_upload(output_path, filename)
+
+        with open(output_path, 'rb') as f:
+            pdf_bytes = f.read()
+            pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
+
+        # Send agent approval email
+        agent_email_addr = agent.get('email', '')
+        if agent_email_addr:
+            email_html = agent_approval_email_html(
+                agent_name=agent.get('agent_name', 'Agent'),
+                agency_name=agent.get('agency_name', 'SafariFlow'),
+                client_name=client_name,
+                quote_number=quote_number,
+                start_date=start_date,
+                end_date=end_date,
+                total_price=total_price,
+                approve_url=approve_url,
+                reject_url=reject_url,
+                brand_primary=agent.get('brand_color_primary', '#2E4A7A'),
+                brand_secondary=agent.get('brand_color_secondary', '#C4922A'),
+            )
+            send_email(
+                to=agent_email_addr,
+                subject=f"New Package Quote Ready — {client_name} ({quote_number})",
+                html=email_html,
+                attachments=[{'filename': filename, 'content': pdf_base64}]
+            )
+
+        logger.info(f"Package PDF complete: {filename}")
+        return jsonify({
+            'success': True,
+            'filename': filename,
+            'quote_number': quote_number,
+            'pdf_base64': pdf_base64,
+            'pdf_url': pdf_url,
+            'client_name': client_name,
+            'client_email': client_email,
+            'agent_email': agent.get('email', ''),
+            'total_price_usd': total_price,
+            'deposit_usd': deposit,
+            'balance_usd': balance,
+            'approve_url': approve_url,
+            'reject_url': reject_url,
+            'client_accept_url': client_accept_url,
+            'client_changes_url': client_changes_url,
+        })
+
+    except Exception as e:
+        logger.error(f"Package PDF failed: {str(e)}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':
