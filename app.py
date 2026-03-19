@@ -830,7 +830,7 @@ def client_changes():
     if not quote_id:
         return invalid_page()
 
-    # Fetch quote details for context
+    # Fetch quote and agent details
     quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
     quote = quotes[0] if quotes else {}
     agents = supabase_get('agents', {'id': f'eq.{quote.get("agent_id", "")}', 'select': '*'})
@@ -838,6 +838,563 @@ def client_changes():
     brand_primary = agent.get('brand_color_primary', '#2E4A7A')
     brand_secondary = agent.get('brand_color_secondary', '#C4922A')
     agency_name = agent.get('agency_name', 'SafariFlow')
+
+    # Fetch optional extras for this agent
+    extras = supabase_get('optional_extras', {
+        'agent_id': f'eq.{agent.get("id", "")}',
+        'is_active': 'eq.true',
+        'select': 'id,name,category,price_per_person_usd_cents,price_type,duration_hours',
+        'order': 'category.asc,name.asc'
+    }) if agent.get('id') else []
+
+    # Build extras buttons HTML
+    extras_html = ''
+    if extras:
+        extras_buttons = ''
+        for ex in extras:
+            price = ex.get('price_per_person_usd_cents', 0) / 100
+            price_label = f"${price:,.0f}/pp" if ex.get('price_type') == 'per_person' else f"${price:,.0f}/grp"
+            extras_buttons += f'''
+            <div class="extra-btn" onclick="toggleExtra(this)" data-id="{ex['id']}" data-name="{ex['name']}">
+              <input type="hidden" name="extra_{ex['id']}" value="no" class="extra-input">
+              <div class="extra-name">{ex['name']}</div>
+              <div class="extra-meta">{ex.get('category','')} · {ex.get('duration_hours',2)}h · {price_label}</div>
+            </div>'''
+        extras_html = f'''
+      <div class="section-label" style="margin-top:24px;">Would you like to add any extras?</div>
+      <p style="font-size:12px;color:#888;margin-bottom:12px;">Tap to add experiences to your revised quote.</p>
+      <div class="extras-grid">{extras_buttons}</div>'''
+
+    min_date = time.strftime('%Y-%m-%d')
+
+    return f'''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Request Changes — {quote_id}</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; }}
+  .container {{ max-width: 580px; margin: 40px auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 16px rgba(0,0,0,0.1); }}
+  .header {{ background: {brand_primary}; padding: 28px; text-align: center; color: white; }}
+  .header h1 {{ font-size: 20px; letter-spacing: 2px; margin-bottom: 4px; }}
+  .header p {{ font-size: 12px; opacity: 0.8; }}
+  .gold-line {{ background: {brand_secondary}; height: 3px; }}
+  .body {{ padding: 32px; }}
+  .body h2 {{ font-size: 18px; color: #1A1A1A; margin-bottom: 6px; }}
+  .sub {{ font-size: 13px; color: #666; margin-bottom: 24px; }}
+  .section-label {{ font-size: 11px; font-weight: bold; letter-spacing: 1px; color: #999; text-transform: uppercase; margin-bottom: 10px; }}
+  .quote-ref {{ background: #F8F6F2; border-radius: 8px; padding: 12px 16px; margin-bottom: 24px; font-size: 13px; color: #666; }}
+  .quote-ref span {{ color: {brand_secondary}; font-weight: bold; font-family: monospace; }}
+
+  /* Change toggle buttons */
+  .changes-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 8px; }}
+  .change-btn {{
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 14px; border-radius: 10px; cursor: pointer;
+    border: 2px solid #E8E4DE; background: #F8F6F2;
+    transition: all 0.2s; user-select: none;
+  }}
+  .change-btn:hover {{ border-color: {brand_secondary}; }}
+  .change-btn.selected {{ border-color: {brand_primary}; background: rgba(46,74,122,0.07); }}
+  .change-btn input {{ display: none; }}
+  .change-icon {{ font-size: 20px; flex-shrink: 0; }}
+  .change-label {{ font-size: 13px; color: #1A1A1A; font-weight: 500; flex: 1; }}
+  .change-btn.selected .change-label {{ color: {brand_primary}; font-weight: 700; }}
+  .check-mark {{
+    width: 20px; height: 20px; border-radius: 50%;
+    background: {brand_primary}; color: white; font-size: 11px;
+    display: none; align-items: center; justify-content: center; flex-shrink: 0;
+  }}
+  .change-btn.selected .check-mark {{ display: flex; }}
+
+  /* Expandable fields */
+  .expand-field {{
+    display: none; background: #F0EDE8; border-radius: 10px;
+    padding: 16px; margin-top: 10px; margin-bottom: 4px;
+    border: 1px solid #E0D8CE; animation: slideDown 0.2s ease;
+  }}
+  .expand-field.visible {{ display: block; }}
+  @keyframes slideDown {{ from {{ opacity:0; transform:translateY(-8px); }} to {{ opacity:1; transform:translateY(0); }} }}
+  .expand-label {{ font-size: 11px; font-weight: bold; color: #888; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 8px; }}
+
+  /* Budget input */
+  .budget-input {{
+    width: 100%; padding: 10px 14px; border: 1px solid #E8E4DE;
+    border-radius: 8px; font-size: 16px; font-weight: 600;
+    color: #1A1A1A; outline: none; font-family: Arial, sans-serif;
+  }}
+  .budget-input:focus {{ border-color: {brand_primary}; }}
+
+  /* Date input */
+  .form-row-dates {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
+  .date-input {{
+    width: 100%; padding: 10px 12px; border: 1px solid #E8E4DE;
+    border-radius: 8px; font-size: 14px; font-family: Arial, sans-serif;
+    outline: none; color: #1A1A1A; cursor: pointer;
+    transition: border 0.2s;
+  }}
+  .date-input:focus {{ border-color: {brand_primary}; }}
+
+  /* Traveler stepper */
+  .stepper-row {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }}
+  .stepper-label {{ font-size: 13px; color: #444; font-weight: 500; }}
+  .stepper-controls {{ display: flex; align-items: center; gap: 12px; }}
+  .stepper-btn {{
+    width: 32px; height: 32px; border-radius: 50%;
+    background: {brand_primary}; color: white; border: none;
+    font-size: 18px; cursor: pointer; display: flex;
+    align-items: center; justify-content: center; font-weight: bold;
+  }}
+  .stepper-btn:hover {{ opacity: 0.85; }}
+  .stepper-value {{ font-size: 16px; font-weight: 700; color: #1A1A1A; min-width: 24px; text-align: center; }}
+
+  /* Extras */
+  .extras-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }}
+  .extra-btn {{
+    padding: 12px 14px; border-radius: 10px; cursor: pointer;
+    border: 2px solid #E8E4DE; background: #F8F6F2;
+    transition: all 0.2s; user-select: none;
+  }}
+  .extra-btn:hover {{ border-color: {brand_secondary}; }}
+  .extra-btn.selected {{ border-color: {brand_secondary}; background: rgba(196,146,42,0.08); }}
+  .extra-name {{ font-size: 13px; color: #1A1A1A; font-weight: 600; margin-bottom: 3px; }}
+  .extra-btn.selected .extra-name {{ color: {brand_secondary}; }}
+  .extra-meta {{ font-size: 11px; color: #888; }}
+  .extra-btn.selected .extra-meta {{ color: {brand_secondary}; opacity: 0.8; }}
+
+  /* Notes */
+  .notes-area {{
+    width: 100%; padding: 12px 14px; border: 1px solid #E8E4DE;
+    border-radius: 8px; font-size: 13px; font-family: Arial, sans-serif;
+    outline: none; resize: vertical; min-height: 80px;
+    transition: border 0.2s; color: #1A1A1A;
+  }}
+  .notes-area:focus {{ border-color: {brand_primary}; }}
+
+  .submit-btn {{
+    width: 100%; background: {brand_primary}; color: white; border: none;
+    padding: 14px; border-radius: 8px; font-size: 15px; font-weight: bold;
+    cursor: pointer; letter-spacing: 1px; margin-top: 8px;
+  }}
+  .submit-btn:hover {{ opacity: 0.9; }}
+
+  @media (max-width: 480px) {{
+    .changes-grid, .extras-grid {{ grid-template-columns: 1fr; }}
+  }}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>{agency_name}</h1>
+    <p>REQUEST CHANGES TO YOUR QUOTE</p>
+  </div>
+  <div class="gold-line"></div>
+  <div class="body">
+    <h2>What would you like changed?</h2>
+    <p class="sub">Tap the options below. We'll revise your quote and send it back to you.</p>
+
+    <div class="quote-ref">Quote Reference: <span>{quote_id}</span></div>
+
+    <form method="POST" action="/client-changes-confirm" id="changeForm">
+      <input type="hidden" name="token" value="{token}">
+      <input type="hidden" name="revised_month" id="revised_month_hidden" value="">
+      <input type="hidden" name="revised_adults" id="revised_adults_hidden" value="0">
+      <input type="hidden" name="revised_children" id="revised_children_hidden" value="0">
+
+      <div class="section-label">What needs changing?</div>
+
+      <div class="changes-grid">
+
+        <!-- Accommodation -->
+        <div class="change-btn" onclick="toggleChange(this, 'accommodation')">
+          <input type="hidden" name="change_accommodation" value="no">
+          <span class="change-icon">🏨</span>
+          <span class="change-label">Accommodation</span>
+          <span class="check-mark">✓</span>
+        </div>
+
+        <!-- Travel Dates -->
+        <div class="change-btn" onclick="toggleChange(this, 'dates')">
+          <input type="hidden" name="change_dates" value="no">
+          <span class="change-icon">📅</span>
+          <span class="change-label">Travel Dates</span>
+          <span class="check-mark">✓</span>
+        </div>
+
+        <!-- Budget -->
+        <div class="change-btn" onclick="toggleChange(this, 'budget')">
+          <input type="hidden" name="change_budget" value="no">
+          <span class="change-icon">💰</span>
+          <span class="change-label">Budget</span>
+          <span class="check-mark">✓</span>
+        </div>
+
+        <!-- Destinations -->
+        <div class="change-btn" onclick="toggleChange(this, 'destinations')">
+          <input type="hidden" name="change_destinations" value="no">
+          <span class="change-icon">📍</span>
+          <span class="change-label">Destinations</span>
+          <span class="check-mark">✓</span>
+        </div>
+
+        <!-- Travelers -->
+        <div class="change-btn" onclick="toggleChange(this, 'travelers')">
+          <input type="hidden" name="change_travelers" value="no">
+          <span class="change-icon">👥</span>
+          <span class="change-label">No. of Travelers</span>
+          <span class="check-mark">✓</span>
+        </div>
+
+        <!-- Transport -->
+        <div class="change-btn" onclick="toggleChange(this, 'transport')">
+          <input type="hidden" name="change_transport" value="no">
+          <span class="change-icon">✈️</span>
+          <span class="change-label">Transport</span>
+          <span class="check-mark">✓</span>
+        </div>
+
+        <!-- Duration -->
+        <div class="change-btn" onclick="toggleChange(this, 'duration')">
+          <input type="hidden" name="change_duration" value="no">
+          <span class="change-icon">🌙</span>
+          <span class="change-label">Trip Duration</span>
+          <span class="check-mark">✓</span>
+        </div>
+
+        <!-- Other -->
+        <div class="change-btn" onclick="toggleChange(this, 'other')">
+          <input type="hidden" name="change_other" value="no">
+          <span class="change-icon">✏️</span>
+          <span class="change-label">Other</span>
+          <span class="check-mark">✓</span>
+        </div>
+
+      </div>
+
+      <!-- Budget expand field -->
+      <div class="expand-field" id="field_budget">
+        <div class="expand-label">What is your revised budget? (USD)</div>
+        <input type="number" name="revised_budget" class="budget-input" placeholder="e.g. 8000" min="0">
+      </div>
+
+      <!-- Dates expand field — exact date picker -->
+      <div class="expand-field" id="field_dates">
+        <div class="expand-label">Select New Travel Dates</div>
+        <div class="form-row-dates">
+          <div>
+            <div style="font-size:12px;color:#666;font-weight:600;margin-bottom:6px;">Start Date</div>
+            <input type="date" name="revised_start_date" class="date-input" min="{min_date}">
+          </div>
+          <div>
+            <div style="font-size:12px;color:#666;font-weight:600;margin-bottom:6px;">End Date</div>
+            <input type="date" name="revised_end_date" class="date-input" min="{min_date}">
+          </div>
+        </div>
+        <p style="font-size:11px;color:#999;margin-top:8px;">⚠ Please ensure dates align with your flights</p>
+      </div>
+
+      <!-- Travelers expand field — stepper -->
+      <div class="expand-field" id="field_travelers">
+        <div class="expand-label">How many travelers?</div>
+        <div class="stepper-row">
+          <span class="stepper-label">Adults</span>
+          <div class="stepper-controls">
+            <button type="button" class="stepper-btn" onclick="updatePax('adults', -1)">−</button>
+            <span class="stepper-value" id="adults_display">2</span>
+            <button type="button" class="stepper-btn" onclick="updatePax('adults', 1)">+</button>
+          </div>
+        </div>
+        <div class="stepper-row">
+          <span class="stepper-label">Children</span>
+          <div class="stepper-controls">
+            <button type="button" class="stepper-btn" onclick="updatePax('children', -1)">−</button>
+            <span class="stepper-value" id="children_display">0</span>
+            <button type="button" class="stepper-btn" onclick="updatePax('children', 1)">+</button>
+          </div>
+        </div>
+      </div>
+
+      {extras_html}
+
+      <!-- Always visible notes field -->
+      <div style="margin-top:20px;">
+        <div class="section-label">Anything else you'd like us to know?</div>
+        <textarea name="notes" class="notes-area" placeholder="Any other details, preferences or requests not covered above..."></textarea>
+      </div>
+
+      <input type="hidden" name="revised_budget_final" id="revised_budget_final" value="">
+
+      <button type="submit" class="submit-btn">✏️ SUBMIT CHANGE REQUEST</button>
+    </form>
+  </div>
+</div>
+
+<script>
+  // ── Change toggle ──────────────────────────────────────────────────────────
+  function toggleChange(btn, type) {{
+    btn.classList.toggle('selected');
+    var input = btn.querySelector('input[type="hidden"]');
+    var isSelected = btn.classList.contains('selected');
+    input.value = isSelected ? 'yes' : 'no';
+
+    // Show/hide expand fields
+    var field = document.getElementById('field_' + type);
+    if (field) {{
+      if (isSelected) {{
+        field.classList.add('visible');
+      }} else {{
+        field.classList.remove('visible');
+      }}
+    }}
+  }}
+
+  // ── Date validation — end date must be after start date ───────────────────
+  document.addEventListener('change', function(e) {{
+    if (e.target.name === 'revised_start_date') {{
+      var endInput = document.querySelector('[name="revised_end_date"]');
+      if (endInput) {{
+        endInput.min = e.target.value;
+        if (endInput.value && endInput.value < e.target.value) {{
+          endInput.value = '';
+        }}
+      }}
+    }}
+  }});
+
+  // ── Traveler stepper ───────────────────────────────────────────────────────
+  var adults = 2;
+  var children = 0;
+
+  function updatePax(type, delta) {{
+    if (type === 'adults') {{
+      adults = Math.max(1, adults + delta);
+      document.getElementById('adults_display').textContent = adults;
+      document.getElementById('revised_adults_hidden').value = adults;
+    }} else {{
+      children = Math.max(0, children + delta);
+      document.getElementById('children_display').textContent = children;
+      document.getElementById('revised_children_hidden').value = children;
+    }}
+  }}
+
+  // ── Extras toggle ──────────────────────────────────────────────────────────
+  function toggleExtra(btn) {{
+    btn.classList.toggle('selected');
+    var input = btn.querySelector('.extra-input');
+    input.value = btn.classList.contains('selected') ? 'yes' : 'no';
+  }}
+</script>
+</body>
+</html>'''
+
+    # Build extras buttons HTML
+    extras_html = ''
+    if extras:
+        extras_buttons = ''
+        for ex in extras:
+            price = ex.get('price_per_person_usd_cents', 0) / 100
+            price_label = f"${price:,.0f}/pp" if ex.get('price_type') == 'per_person' else f"${price:,.0f}/grp"
+            extras_buttons += f'''
+            <div class="extra-btn" onclick="toggleExtra(this)" data-id="{ex['id']}" data-name="{ex['name']}">
+              <input type="hidden" name="extra_{ex['id']}" value="no" class="extra-input">
+              <div class="extra-name">{ex['name']}</div>
+              <div class="extra-meta">{ex.get('category','')} · {ex.get('duration_hours',2)}h · {price_label}</div>
+            </div>'''
+
+        extras_html = f'''
+      <div class="section-label" style="margin-top:20px;">Would you like to add any extras?</div>
+      <div class="extras-grid">{extras_buttons}</div>'''
+
+    return f'''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Request Changes — {quote_id}</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; }}
+  .container {{ max-width: 580px; margin: 40px auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 16px rgba(0,0,0,0.1); }}
+  .header {{ background: {brand_primary}; padding: 28px; text-align: center; color: white; }}
+  .header h1 {{ font-size: 20px; letter-spacing: 2px; margin-bottom: 4px; }}
+  .header p {{ font-size: 12px; opacity: 0.8; }}
+  .gold-line {{ background: {brand_secondary}; height: 3px; }}
+  .body {{ padding: 32px; }}
+  .body h2 {{ font-size: 18px; color: #1A1A1A; margin-bottom: 6px; }}
+  .sub {{ font-size: 13px; color: #666; margin-bottom: 24px; }}
+  .section-label {{ font-size: 11px; font-weight: bold; letter-spacing: 1px; color: #999; text-transform: uppercase; margin-bottom: 10px; }}
+  .quote-ref {{ background: #F8F6F2; border-radius: 8px; padding: 12px 16px; margin-bottom: 24px; font-size: 13px; color: #666; }}
+  .quote-ref span {{ color: {brand_secondary}; font-weight: bold; font-family: monospace; }}
+
+  /* Change toggle buttons */
+  .changes-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }}
+  .change-btn {{
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 14px; border-radius: 10px; cursor: pointer;
+    border: 2px solid #E8E4DE; background: #F8F6F2;
+    transition: all 0.2s; user-select: none;
+  }}
+  .change-btn:hover {{ border-color: {brand_secondary}; }}
+  .change-btn.selected {{ border-color: {brand_primary}; background: rgba(46,74,122,0.08); }}
+  .change-btn input {{ display: none; }}
+  .change-icon {{ font-size: 20px; flex-shrink: 0; }}
+  .change-label {{ font-size: 13px; color: #1A1A1A; font-weight: 500; }}
+  .change-btn.selected .change-label {{ color: {brand_primary}; font-weight: 700; }}
+  .check-mark {{ margin-left: auto; width: 20px; height: 20px; border-radius: 50%; background: {brand_primary}; color: white; font-size: 11px; display: none; align-items: center; justify-content: center; flex-shrink: 0; }}
+  .change-btn.selected .check-mark {{ display: flex; }}
+
+  /* Extras toggle buttons */
+  .extras-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }}
+  .extra-btn {{
+    padding: 12px 14px; border-radius: 10px; cursor: pointer;
+    border: 2px solid #E8E4DE; background: #F8F6F2;
+    transition: all 0.2s; user-select: none;
+  }}
+  .extra-btn:hover {{ border-color: {brand_secondary}; }}
+  .extra-btn.selected {{ border-color: {brand_secondary}; background: rgba(196,146,42,0.08); }}
+  .extra-name {{ font-size: 13px; color: #1A1A1A; font-weight: 600; margin-bottom: 3px; }}
+  .extra-btn.selected .extra-name {{ color: {brand_secondary}; }}
+  .extra-meta {{ font-size: 11px; color: #888; }}
+  .extra-btn.selected .extra-meta {{ color: {brand_secondary}; opacity: 0.8; }}
+
+  /* Budget row */
+  .budget-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }}
+  .form-group {{ margin-bottom: 16px; }}
+  .form-group label {{ display: block; font-size: 12px; font-weight: bold; color: #666; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }}
+  .form-group input, .form-group textarea, .form-group select {{
+    width: 100%; padding: 10px 12px; border: 1px solid #E8E4DE;
+    border-radius: 8px; font-size: 13px; font-family: Arial, sans-serif;
+    outline: none; transition: border 0.2s;
+  }}
+  .form-group input:focus, .form-group textarea:focus {{ border-color: {brand_primary}; }}
+  .form-group textarea {{ min-height: 80px; resize: vertical; }}
+  .submit-btn {{
+    width: 100%; background: {brand_primary}; color: white; border: none;
+    padding: 14px; border-radius: 8px; font-size: 15px; font-weight: bold;
+    cursor: pointer; letter-spacing: 1px; margin-top: 8px;
+  }}
+  .submit-btn:hover {{ opacity: 0.9; }}
+  @media (max-width: 480px) {{
+    .changes-grid, .extras-grid {{ grid-template-columns: 1fr; }}
+    .budget-row {{ grid-template-columns: 1fr; }}
+  }}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>{agency_name}</h1>
+    <p>REQUEST CHANGES TO YOUR QUOTE</p>
+  </div>
+  <div class="gold-line"></div>
+  <div class="body">
+    <h2>What would you like changed?</h2>
+    <p class="sub">Tap the options below and we'll revise your quote and send it back to you.</p>
+
+    <div class="quote-ref">Quote Reference: <span>{quote_id}</span></div>
+
+    <form method="POST" action="/client-changes-confirm">
+      <input type="hidden" name="token" value="{token}">
+
+      <div class="section-label">What needs changing?</div>
+      <div class="changes-grid">
+        <div class="change-btn" onclick="toggleChange(this)">
+          <input type="hidden" name="change_accommodation" value="no">
+          <span class="change-icon">🏨</span>
+          <span class="change-label">Accommodation</span>
+          <span class="check-mark">✓</span>
+        </div>
+        <div class="change-btn" onclick="toggleChange(this)">
+          <input type="hidden" name="change_dates" value="no">
+          <span class="change-icon">📅</span>
+          <span class="change-label">Travel Dates</span>
+          <span class="check-mark">✓</span>
+        </div>
+        <div class="change-btn" onclick="toggleChange(this)">
+          <input type="hidden" name="change_budget" value="no">
+          <span class="change-icon">💰</span>
+          <span class="change-label">Budget</span>
+          <span class="check-mark">✓</span>
+        </div>
+        <div class="change-btn" onclick="toggleChange(this)">
+          <input type="hidden" name="change_destinations" value="no">
+          <span class="change-icon">📍</span>
+          <span class="change-label">Destinations</span>
+          <span class="check-mark">✓</span>
+        </div>
+        <div class="change-btn" onclick="toggleChange(this)">
+          <input type="hidden" name="change_travelers" value="no">
+          <span class="change-icon">👥</span>
+          <span class="change-label">No. of Travelers</span>
+          <span class="check-mark">✓</span>
+        </div>
+        <div class="change-btn" onclick="toggleChange(this)">
+          <input type="hidden" name="change_transport" value="no">
+          <span class="change-icon">✈️</span>
+          <span class="change-label">Transport</span>
+          <span class="check-mark">✓</span>
+        </div>
+        <div class="change-btn" onclick="toggleChange(this)">
+          <input type="hidden" name="change_duration" value="no">
+          <span class="change-icon">🌙</span>
+          <span class="change-label">Trip Duration</span>
+          <span class="check-mark">✓</span>
+        </div>
+        <div class="change-btn" onclick="toggleChange(this)">
+          <input type="hidden" name="change_other" value="no">
+          <span class="change-icon">✏️</span>
+          <span class="change-label">Other</span>
+          <span class="check-mark">✓</span>
+        </div>
+      </div>
+
+      {extras_html}
+
+      <div class="budget-row">
+        <div class="form-group">
+          <label>Revised Budget (USD)</label>
+          <input type="number" name="revised_budget" placeholder="e.g. 8000">
+        </div>
+        <div class="form-group">
+          <label>Preferred Travel Month</label>
+          <select name="preferred_month">
+            <option value="">— No change —</option>
+            <option>January</option><option>February</option><option>March</option>
+            <option>April</option><option>May</option><option>June</option>
+            <option>July</option><option>August</option><option>September</option>
+            <option>October</option><option>November</option><option>December</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>Additional Notes</label>
+        <textarea name="notes" placeholder="Please describe any specific changes you would like..."></textarea>
+      </div>
+
+      <button type="submit" class="submit-btn">✏️ SUBMIT CHANGE REQUEST</button>
+    </form>
+  </div>
+</div>
+
+<script>
+function toggleChange(btn) {{
+  btn.classList.toggle('selected');
+  var input = btn.querySelector('input[type="hidden"]');
+  input.value = btn.classList.contains('selected') ? 'yes' : 'no';
+}}
+
+function toggleExtra(btn) {{
+  btn.classList.toggle('selected');
+  var input = btn.querySelector('.extra-input');
+  input.value = btn.classList.contains('selected') ? 'yes' : 'no';
+}}
+</script>
+</body>
+</html>'''
 
     return f'''<!DOCTYPE html>
 <html>
@@ -963,7 +1520,13 @@ def client_changes_confirm():
     if not quote_id:
         return invalid_page()
 
-    # Capture all change request details
+    # Capture selected extras
+    selected_extras = []
+    for key, value in request.form.items():
+        if key.startswith('extra_') and value == 'yes':
+            extra_id = key.replace('extra_', '')
+            selected_extras.append(extra_id)
+
     change_request = {
         'accommodation': request.form.get('change_accommodation') == 'yes',
         'dates':         request.form.get('change_dates') == 'yes',
@@ -973,9 +1536,15 @@ def client_changes_confirm():
         'transport':     request.form.get('change_transport') == 'yes',
         'duration':      request.form.get('change_duration') == 'yes',
         'other':         request.form.get('change_other') == 'yes',
-        'revised_budget':   request.form.get('revised_budget', ''),
-        'preferred_month':  request.form.get('preferred_month', ''),
-        'notes':            request.form.get('notes', ''),
+        'revised_budget':    request.form.get('revised_budget', ''),
+        'revised_start_date': request.form.get('revised_start_date', ''),
+        'revised_end_date':   request.form.get('revised_end_date', ''),
+        'revised_month':      request.form.get('revised_month', ''),
+        'revised_adults':     request.form.get('revised_adults', '0'),
+        'revised_children':   request.form.get('revised_children', '0'),
+        'preferred_month':    request.form.get('revised_month', ''),
+        'notes':              request.form.get('notes', ''),
+        'selected_extras':    selected_extras,
     }
 
     # Build human-readable summary for agent notification
