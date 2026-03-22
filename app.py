@@ -35,7 +35,7 @@ PORTAL_URL          = os.environ.get('PORTAL_URL', 'https://safariflow-portal.ne
 RESEND_API_KEY      = os.environ.get('RESEND_API_KEY', '')
 RESEND_FROM         = os.environ.get('RESEND_FROM', 'SafariFlow <onboarding@resend.dev>')
 UNSPLASH_ACCESS_KEY = os.environ.get('UNSPLASH_ACCESS_KEY', '')
-STORAGE_BUCKET      = 'quote-pdfs'
+CLERK_WEBHOOK_SECRET = os.environ.get('CLERK_WEBHOOK_SECRET', '')
 OUTPUT_DIR          = os.path.join(os.path.dirname(__file__), 'outputs')
 TOKEN_EXPIRY_DAYS   = 7
 
@@ -129,21 +129,29 @@ def supabase_update(table, match_params, update_data):
 
 def supabase_upload(file_path, filename):
     if not SUPABASE_URL or not SUPABASE_KEY:
+        logger.error("Supabase credentials missing — cannot upload")
         return ''
     try:
         upload_url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{filename}"
+        logger.info(f"Uploading to: {upload_url}")
         with open(file_path, 'rb') as f:
             pdf_bytes = f.read()
+        logger.info(f"File size: {len(pdf_bytes)} bytes")
         req = urllib.request.Request(upload_url, data=pdf_bytes, method='POST', headers={
             'Authorization': f'Bearer {SUPABASE_KEY}',
             'Content-Type': 'application/pdf',
             'x-upsert': 'true',
         })
         with urllib.request.urlopen(req, timeout=120) as resp:
-            resp.read()
+            response_body = resp.read().decode()
+            logger.info(f"Upload response: {response_body}")
         public_url = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{filename}"
         logger.info(f"Uploaded to Supabase Storage: {public_url}")
         return public_url
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode()
+        logger.error(f"Supabase upload HTTP error: {e.code} {e.reason} — {error_body}")
+        return ''
     except Exception as e:
         logger.error(f"Supabase upload error: {str(e)}")
         return ''
@@ -331,7 +339,7 @@ def call_claude(prompt, max_tokens=4000):
         return {}
     try:
         payload = json.dumps({
-            "model": "claude-sonnet-4-5",
+            "model": "claude-sonnet-4-6",
             "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}]
         }).encode('utf-8')
@@ -426,10 +434,125 @@ def fetch_photos_for_itinerary(itinerary):
     return photo_cache
 
 
-# ─── Routes ───────────────────────────────────────────────────────────────────
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'ok', 'service': 'SafariFlow PDF Generator v5'})
+# ─── Clerk Webhook — Auto create agent on signup ──────────────────────────────
+@app.route('/clerk-webhook', methods=['POST'])
+def clerk_webhook():
+    try:
+        # Verify webhook signature
+        payload = request.get_data()
+        svix_id        = request.headers.get('svix-id', '')
+        svix_timestamp = request.headers.get('svix-timestamp', '')
+        svix_signature = request.headers.get('svix-signature', '')
+
+        if CLERK_WEBHOOK_SECRET:
+            signed_content = f"{svix_id}.{svix_timestamp}.{payload.decode('utf-8')}"
+            secret_bytes = base64.b64decode(CLERK_WEBHOOK_SECRET.replace('whsec_', ''))
+            expected_sig = 'v1,' + base64.b64encode(
+                hmac.new(secret_bytes, signed_content.encode(), hashlib.sha256).digest()
+            ).decode()
+            sigs = svix_signature.split(' ')
+            if not any(s == expected_sig for s in sigs):
+                logger.warning("Clerk webhook signature verification failed")
+                return jsonify({'error': 'Invalid signature'}), 401
+
+        data = json.loads(payload)
+        event_type = data.get('type')
+        logger.info(f"Clerk webhook received: {event_type}")
+
+        if event_type == 'user.created':
+            user_data   = data.get('data', {})
+            clerk_id    = user_data.get('id', '')
+            email       = ''
+            first_name  = user_data.get('first_name', '')
+            last_name   = user_data.get('last_name', '')
+            agent_name  = f"{first_name} {last_name}".strip() or 'Safari Agent'
+
+            # Get primary email
+            emails = user_data.get('email_addresses', [])
+            if emails:
+                email = emails[0].get('email_address', '')
+
+            # Check if agent already exists
+            existing = supabase_get('agents', {
+                'clerk_user_id': f'eq.{clerk_id}',
+                'select': 'id'
+            })
+            if existing:
+                logger.info(f"Agent already exists for clerk_id: {clerk_id}")
+                return jsonify({'status': 'exists'}), 200
+
+            # Create agent record in Supabase
+            agent_id = str(uuid.uuid4())
+            new_agent = {
+                'id': agent_id,
+                'clerk_user_id': clerk_id,
+                'agent_name': agent_name,
+                'agency_name': f"{agent_name} Safaris",
+                'email': email,
+                'brand_color_primary': '#2E4A7A',
+                'brand_color_secondary': '#C4922A',
+                'deposit_percentage': 30,
+                'balance_due_days': 60,
+                'markup_type': 'overall',
+                'markup_overall_pct': 20,
+                'subscription_status': 'trial',
+                'subscription_plan': 'free',
+            }
+
+            # Insert via Supabase REST
+            insert_url = f"{SUPABASE_URL}/rest/v1/agents"
+            insert_payload = json.dumps(new_agent).encode('utf-8')
+            req = urllib.request.Request(
+                insert_url,
+                data=insert_payload,
+                method='POST',
+                headers={
+                    'Authorization': f'Bearer {SUPABASE_KEY}',
+                    'apikey': SUPABASE_KEY,
+                    'Content-Type': 'application/json',
+                    'Prefer': 'return=representation',
+                }
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                resp.read()
+
+            logger.info(f"Agent created: {agent_id} for {email}")
+
+            # Send welcome email
+            if email and RESEND_API_KEY:
+                welcome_html = f"""
+                <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 16px rgba(0,0,0,0.1)">
+                  <div style="background:#2E4A7A;padding:32px;text-align:center;color:white">
+                    <h1 style="margin:0;font-size:24px;letter-spacing:2px">SAFARIFLOW</h1>
+                    <p style="margin:8px 0 0;opacity:0.8;font-size:13px">WHERE SAFARI BUSINESS GROWS</p>
+                  </div>
+                  <div style="background:#C4922A;height:3px"></div>
+                  <div style="padding:32px">
+                    <h2 style="color:#1A1A1A;margin-bottom:8px">Welcome, {agent_name}! 🦁</h2>
+                    <p style="color:#444;line-height:1.7">Your SafariFlow account is ready. You can now start generating AI-powered safari quotes in minutes.</p>
+                    <div style="background:#F8F6F2;border-radius:8px;padding:20px;margin:24px 0">
+                      <p style="margin:0 0 8px;font-weight:bold;color:#1A1A1A">Getting started:</p>
+                      <p style="margin:4px 0;color:#444;font-size:13px">1. Complete your agency profile in Settings</p>
+                      <p style="margin:4px 0;color:#444;font-size:13px">2. Add your inventory — accommodations, transport, park fees</p>
+                      <p style="margin:4px 0;color:#444;font-size:13px">3. Generate your first AI quote</p>
+                    </div>
+                    <a href="{PORTAL_URL}" style="display:inline-block;background:#2E4A7A;color:white;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold;letter-spacing:1px">OPEN MY PORTAL →</a>
+                  </div>
+                </div>"""
+                send_email(
+                    to=email,
+                    subject="Welcome to SafariFlow — Your AI Safari Quoting Platform 🦁",
+                    html=welcome_html
+                )
+
+        return jsonify({'status': 'ok'}), 200
+
+    except Exception as e:
+        logger.error(f"Clerk webhook error: {str(e)}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+
 
 
 @app.route('/generate-pdf', methods=['POST'])
