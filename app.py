@@ -331,7 +331,7 @@ def call_claude(prompt, max_tokens=4000):
         return {}
     try:
         payload = json.dumps({
-            "model": "claude-sonnet-4-6",
+            "model": "claude-sonnet-4-5",
             "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}]
         }).encode('utf-8')
