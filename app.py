@@ -36,6 +36,7 @@ RESEND_API_KEY      = os.environ.get('RESEND_API_KEY', '')
 RESEND_FROM         = os.environ.get('RESEND_FROM', 'SafariFlow <onboarding@resend.dev>')
 UNSPLASH_ACCESS_KEY = os.environ.get('UNSPLASH_ACCESS_KEY', '')
 CLERK_WEBHOOK_SECRET = os.environ.get('CLERK_WEBHOOK_SECRET', '')
+STORAGE_BUCKET      = 'quote-pdfs'
 OUTPUT_DIR          = os.path.join(os.path.dirname(__file__), 'outputs')
 TOKEN_EXPIRY_DAYS   = 7
 
