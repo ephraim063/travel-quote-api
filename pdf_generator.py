@@ -984,7 +984,7 @@ def generate_invoice_pdf(data, output_path):
         author=agency,
     )
 
-    S = build_styles(brand_primary, brand_secondary)
+    S = {}  # Invoice uses inline styles — no shared style object needed
     story = []
 
     # ── Header ────────────────────────────────────────────────
