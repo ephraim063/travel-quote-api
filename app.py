@@ -711,7 +711,6 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
                 'balance_amount_usd': balance,
             },
             'line_items': line_items,
-            'itinerary':  itinerary,
         }
 
         quote_record = {
@@ -738,7 +737,6 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
             'special_requests':         special_requests,
         }
 
-        # Try insert first — if exists update instead
         try:
             insert_url = f"{SUPABASE_URL}/rest/v1/quotes"
             insert_req = urllib.request.Request(
@@ -755,6 +753,48 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
             with urllib.request.urlopen(insert_req, timeout=15) as resp:
                 resp.read()
             logger.info(f"Quote saved to Supabase: {quote_number}, total=${total_price}")
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode()
+            logger.error(f"Quote save HTTP error {e.code}: {error_body}")
+            # Try minimal save without itinerary_json
+            try:
+                minimal_record = {
+                    'quote_number':             quote_number,
+                    'agent_id':                 agent_id,
+                    'status':                   'generated',
+                    'source':                   data.get('source', 'portal'),
+                    'client_name':              client_name,
+                    'client_email':             client_email,
+                    'destinations':             destinations,
+                    'start_date':               start_date[:10] if start_date else None,
+                    'end_date':                 end_date[:10] if end_date else None,
+                    'duration_days':            duration_days,
+                    'pax_adults':               pax_adults,
+                    'pax_children':             pax_children,
+                    'total_price_usd_cents':    int(total_price * 100),
+                    'client_budget_usd_cents':  int(budget_usd * 100),
+                    'pdf_url':                  pdf_url,
+                    'accept_token':             client_accept_token,
+                    'change_token':             client_changes_token,
+                    'reject_token':             reject_token,
+                }
+                insert_req2 = urllib.request.Request(
+                    insert_url,
+                    data=json.dumps(minimal_record).encode('utf-8'),
+                    method='POST',
+                    headers={
+                        'Authorization': f'Bearer {SUPABASE_KEY}',
+                        'apikey': SUPABASE_KEY,
+                        'Content-Type': 'application/json',
+                        'Prefer': 'return=minimal,resolution=merge-duplicates',
+                    }
+                )
+                with urllib.request.urlopen(insert_req2, timeout=15) as resp:
+                    resp.read()
+                logger.info(f"Quote saved (minimal) to Supabase: {quote_number}")
+            except urllib.error.HTTPError as e2:
+                error_body2 = e2.read().decode()
+                logger.error(f"Quote minimal save error {e2.code}: {error_body2}")
         except Exception as e:
             logger.error(f"Quote save error: {str(e)}")
 
