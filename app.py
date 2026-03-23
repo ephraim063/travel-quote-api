@@ -753,6 +753,16 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
             'deposit_usd':       deposit,
             'balance_usd':       balance,
             'itinerary_days':    len(itinerary),
+            'line_items':        line_items,
+            'itinerary_json':    {
+                'pricing': {
+                    'total_price_usd':   total_price,
+                    'deposit_amount_usd': deposit,
+                    'balance_amount_usd': balance,
+                },
+                'line_items': line_items,
+                'itinerary':  itinerary,
+            },
             'approve_url':       approve_url,
             'reject_url':        reject_url,
             'client_accept_url': client_accept_url,
@@ -2011,6 +2021,25 @@ def generate_invoice():
         deposit_pct     = float(agent.get('deposit_percentage', 30) or 30)
         balance_days    = int(agent.get('balance_due_days', 60) or 60)
         total_cents     = int(quote.get('total_price_usd_cents', 0) or 0)
+
+        # Fallback — read total from itinerary_json if not saved directly
+        if total_cents == 0:
+            try:
+                itinerary = quote.get('itinerary_json')
+                if itinerary:
+                    if isinstance(itinerary, str):
+                        import json as _json
+                        itinerary = _json.loads(itinerary)
+                    pricing = itinerary.get('pricing', {})
+                    total_usd = float(pricing.get('total_price_usd', 0) or 0)
+                    if total_usd == 0:
+                        # Try line items sum
+                        line_items_raw = itinerary.get('line_items', [])
+                        total_usd = sum(float(i.get('total_price', 0)) for i in line_items_raw)
+                    total_cents = int(total_usd * 100)
+                    logger.info(f"Total read from itinerary_json: ${total_usd}")
+            except Exception as e:
+                logger.warning(f"Could not read total from itinerary_json: {e}")
         deposit_cents   = int(round(total_cents * deposit_pct / 100))
         balance_cents   = total_cents - deposit_cents
         deposit_due     = str(today + datetime.timedelta(days=7))
@@ -2026,8 +2055,18 @@ def generate_invoice():
 
         inv_number = generate_invoice_number(agent_id)
 
-        # Build line items from quote
-        line_items = quote.get('line_items', []) or []
+        # Build line items from itinerary_json
+        line_items = []
+        try:
+            itinerary_json = quote.get('itinerary_json')
+            if itinerary_json:
+                if isinstance(itinerary_json, str):
+                    import json as _json
+                    itinerary_json = _json.loads(itinerary_json)
+                line_items = itinerary_json.get('line_items', [])
+        except Exception:
+            pass
+
         if not line_items:
             line_items = [{
                 'description': f"Safari — {quote.get('destinations', '')}",
@@ -2053,7 +2092,7 @@ def generate_invoice():
             'end_date':             quote.get('end_date', None),
             'pax_adults':           int(quote.get('pax_adults', 2) or 2),
             'pax_children':         int(quote.get('pax_children', 0) or 0),
-            'duration_nights':      int(quote.get('duration_nights', 0) or 0),
+            'duration_nights':      int(quote.get('duration_days', 0) or 0),
             'subtotal_usd_cents':   total_cents,
             'tax_usd_cents':        0,
             'total_usd_cents':      total_cents,
