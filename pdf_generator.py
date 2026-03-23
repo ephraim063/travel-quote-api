@@ -927,3 +927,319 @@ def generate_quote_pdf(data: dict, output_path: str):
         onFirstPage=make_page_template(agency, email, date),
         onLaterPages=make_page_template(agency, email, date),
     )
+
+
+# ─── Invoice PDF Generator ────────────────────────────────────────────────────
+def generate_invoice_pdf(data, output_path):
+    """Generate a branded invoice PDF."""
+    import datetime
+
+    agent          = data.get('agent', {})
+    client         = data.get('client', {})
+    invoice        = data.get('invoice', {})
+    line_items     = data.get('line_items', [])
+
+    agency         = safe(agent.get('agency'), 'SafariFlow')
+    agent_email    = safe(agent.get('email'))
+    agent_phone    = safe(agent.get('phone'))
+    logo_url       = agent.get('logo_url', '')
+    brand_primary  = agent.get('brand_color_primary', '#2E4A7A')
+    brand_secondary = agent.get('brand_color_secondary', '#C4922A')
+    cancel_terms   = agent.get('cancellation_terms', '')
+    amendment_terms = agent.get('amendment_terms', '')
+
+    try:
+        BRAND  = HexColor(brand_primary)
+        ACCENT = HexColor(brand_secondary)
+    except Exception:
+        BRAND  = NAVY
+        ACCENT = GOLD
+
+    inv_number     = safe(invoice.get('invoice_number'), 'INV-0001')
+    inv_date       = safe(invoice.get('issued_at', str(datetime.date.today()))[:10])
+    quote_ref      = safe(invoice.get('quote_id'))
+    total          = invoice.get('total_usd_cents', 0) / 100
+    deposit        = invoice.get('deposit_usd_cents', 0) / 100
+    balance        = invoice.get('balance_usd_cents', 0) / 100
+    deposit_due    = safe(invoice.get('deposit_due_date', ''))
+    balance_due    = safe(invoice.get('balance_due_date', ''))
+    bank_details   = safe(agent.get('bank_details', ''))
+    mpesa_details  = safe(agent.get('mpesa_details', ''))
+
+    client_name    = safe(client.get('name'))
+    client_email   = safe(client.get('email'))
+    client_phone   = safe(client.get('phone'))
+    start_date     = safe(invoice.get('start_date', ''))
+    end_date       = safe(invoice.get('end_date', ''))
+    destinations   = safe(invoice.get('destinations', ''))
+    pax_adults     = invoice.get('pax_adults', 2)
+    pax_children   = invoice.get('pax_children', 0)
+
+    doc = SimpleDocTemplate(
+        output_path,
+        pagesize=A4,
+        leftMargin=ML, rightMargin=MR,
+        topMargin=18*mm, bottomMargin=18*mm,
+        title=f"Invoice {inv_number}",
+        author=agency,
+    )
+
+    S = build_styles(brand_primary, brand_secondary)
+    story = []
+
+    # ── Header ────────────────────────────────────────────────
+    # Logo + Agency name
+    header_data = [[
+        Paragraph(f"<b>{agency}</b>", ParagraphStyle('inv_agency',
+            fontName='Helvetica-Bold', fontSize=20, textColor=white,
+            leading=24)),
+        Paragraph(
+            f"{agent_email}<br/>{agent_phone}",
+            ParagraphStyle('inv_contact', fontName='Helvetica',
+                fontSize=9, textColor=HexColor('#CCCCCC'), leading=13))
+    ]]
+    header_table = Table(header_data, colWidths=[CW * 0.6, CW * 0.4])
+    header_table.setStyle(TableStyle([
+        ('BACKGROUND',   (0,0), (-1,-1), BRAND),
+        ('VALIGN',       (0,0), (-1,-1), 'MIDDLE'),
+        ('LEFTPADDING',  (0,0), (-1,-1), 14),
+        ('RIGHTPADDING', (0,0), (-1,-1), 14),
+        ('TOPPADDING',   (0,0), (-1,-1), 16),
+        ('BOTTOMPADDING',(0,0), (-1,-1), 16),
+        ('ALIGN',        (1,0), (1,0), 'RIGHT'),
+    ]))
+    story.append(header_table)
+
+    # Gold line
+    story.append(Table([['']], colWidths=[CW],
+        style=TableStyle([('BACKGROUND', (0,0), (-1,-1), ACCENT),
+                          ('TOPPADDING', (0,0), (-1,-1), 2),
+                          ('BOTTOMPADDING', (0,0), (-1,-1), 2)])))
+    story.append(Spacer(1, 6*mm))
+
+    # ── Invoice title + number ────────────────────────────────
+    title_data = [[
+        Paragraph('INVOICE', ParagraphStyle('inv_title',
+            fontName='Helvetica-Bold', fontSize=28,
+            textColor=BRAND, leading=32)),
+        Paragraph(
+            f"<b>{inv_number}</b><br/>"
+            f"<font size=9 color='#666666'>Date: {inv_date}</font><br/>"
+            f"<font size=9 color='#666666'>Quote Ref: {quote_ref}</font>",
+            ParagraphStyle('inv_meta', fontName='Helvetica',
+                fontSize=11, textColor=EARTH, leading=16,
+                alignment=TA_RIGHT))
+    ]]
+    title_table = Table(title_data, colWidths=[CW * 0.5, CW * 0.5])
+    title_table.setStyle(TableStyle([
+        ('VALIGN', (0,0), (-1,-1), 'BOTTOM'),
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+    ]))
+    story.append(title_table)
+    story.append(Spacer(1, 6*mm))
+
+    # ── Bill To + Trip Details ────────────────────────────────
+    pax_str = f"{pax_adults} Adult{'s' if pax_adults > 1 else ''}"
+    if pax_children:
+        pax_str += f", {pax_children} Child{'ren' if pax_children > 1 else ''}"
+
+    details_data = [[
+        # Bill To
+        Table([
+            [Paragraph('BILL TO', ParagraphStyle('inv_section',
+                fontName='Helvetica-Bold', fontSize=9,
+                textColor=HexColor('#999999'), leading=12))],
+            [Paragraph(f"<b>{client_name}</b>", ParagraphStyle('inv_client',
+                fontName='Helvetica-Bold', fontSize=13,
+                textColor=EARTH, leading=16))],
+            [Paragraph(client_email, ParagraphStyle('inv_small',
+                fontName='Helvetica', fontSize=9,
+                textColor=MUTED, leading=12))],
+            [Paragraph(client_phone, ParagraphStyle('inv_small',
+                fontName='Helvetica', fontSize=9,
+                textColor=MUTED, leading=12))],
+        ], colWidths=[CW * 0.45],
+        style=TableStyle([('LEFTPADDING',(0,0),(-1,-1),0),
+                          ('RIGHTPADDING',(0,0),(-1,-1),0),
+                          ('TOPPADDING',(0,0),(-1,-1),2),
+                          ('BOTTOMPADDING',(0,0),(-1,-1),2)])),
+        # Trip Details
+        Table([
+            [Paragraph('SAFARI DETAILS', ParagraphStyle('inv_section',
+                fontName='Helvetica-Bold', fontSize=9,
+                textColor=HexColor('#999999'), leading=12))],
+            [Paragraph(f"<b>{destinations}</b>", ParagraphStyle('inv_dest',
+                fontName='Helvetica-Bold', fontSize=11,
+                textColor=BRAND, leading=14))],
+            [Paragraph(f"{start_date} → {end_date}", ParagraphStyle('inv_small',
+                fontName='Helvetica', fontSize=9,
+                textColor=MUTED, leading=12))],
+            [Paragraph(pax_str, ParagraphStyle('inv_small',
+                fontName='Helvetica', fontSize=9,
+                textColor=MUTED, leading=12))],
+        ], colWidths=[CW * 0.45],
+        style=TableStyle([('LEFTPADDING',(0,0),(-1,-1),0),
+                          ('RIGHTPADDING',(0,0),(-1,-1),0),
+                          ('TOPPADDING',(0,0),(-1,-1),2),
+                          ('BOTTOMPADDING',(0,0),(-1,-1),2)])),
+    ]]
+    details_table = Table(details_data, colWidths=[CW * 0.5, CW * 0.5])
+    details_table.setStyle(TableStyle([
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+    ]))
+    story.append(details_table)
+    story.append(Spacer(1, 6*mm))
+    story.append(HRFlowable(width=CW, thickness=1, color=HexColor('#E8E4DE')))
+    story.append(Spacer(1, 5*mm))
+
+    # ── Line Items Table ──────────────────────────────────────
+    story.append(Paragraph('SERVICES', ParagraphStyle('inv_section',
+        fontName='Helvetica-Bold', fontSize=9,
+        textColor=HexColor('#999999'), leading=12)))
+    story.append(Spacer(1, 3*mm))
+
+    li_header = ['Description', 'Details', 'Qty', 'Unit Price', 'Total']
+    li_data = [li_header]
+
+    for item in line_items:
+        desc    = item.get('description', '')
+        details = item.get('details', '')
+        qty     = str(item.get('quantity', 1))
+        unit    = f"${item.get('unit_price', 0):,.2f}"
+        total_i = f"${item.get('total_price', 0):,.2f}"
+        li_data.append([desc, details, qty, unit, total_i])
+
+    # Subtotal / Total rows
+    li_data.append(['', '', '', 'SUBTOTAL', f"${total:,.2f}"])
+    li_data.append(['', '', '', 'TOTAL DUE', f"${total:,.2f}"])
+
+    col_widths = [CW*0.30, CW*0.28, CW*0.08, CW*0.16, CW*0.18]
+    li_table = Table(li_data, colWidths=col_widths, repeatRows=1)
+
+    li_style = TableStyle([
+        # Header
+        ('BACKGROUND',   (0,0), (-1,0), BRAND),
+        ('TEXTCOLOR',    (0,0), (-1,0), white),
+        ('FONTNAME',     (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE',     (0,0), (-1,0), 9),
+        ('TOPPADDING',   (0,0), (-1,0), 8),
+        ('BOTTOMPADDING',(0,0), (-1,0), 8),
+        ('ALIGN',        (2,0), (-1,0), 'RIGHT'),
+        # Data rows
+        ('FONTNAME',     (0,1), (-1,-3), 'Helvetica'),
+        ('FONTSIZE',     (0,1), (-1,-3), 9),
+        ('TOPPADDING',   (0,1), (-1,-3), 6),
+        ('BOTTOMPADDING',(0,1), (-1,-3), 6),
+        ('ALIGN',        (2,1), (-1,-3), 'RIGHT'),
+        ('ROWBACKGROUNDS',(0,1),(-1,-3),[white, TABLE_ALT]),
+        ('GRID',         (0,0), (-1,-3), 0.5, HexColor('#E8E4DE')),
+        # Subtotal rows
+        ('FONTNAME',     (0,-2), (-1,-1), 'Helvetica-Bold'),
+        ('FONTSIZE',     (0,-2), (-1,-1), 10),
+        ('ALIGN',        (3,-2), (-1,-1), 'RIGHT'),
+        ('TOPPADDING',   (0,-2), (-1,-1), 8),
+        ('BOTTOMPADDING',(0,-2), (-1,-1), 8),
+        ('LINEABOVE',    (0,-2), (-1,-2), 1, HexColor('#CCCCCC')),
+        ('BACKGROUND',   (0,-1), (-1,-1), HexColor('#F8F6F2')),
+        ('TEXTCOLOR',    (3,-1), (-1,-1), ACCENT),
+    ])
+    li_table.setStyle(li_style)
+    story.append(li_table)
+    story.append(Spacer(1, 6*mm))
+
+    # ── Payment Schedule ──────────────────────────────────────
+    story.append(Paragraph('PAYMENT SCHEDULE', ParagraphStyle('inv_section',
+        fontName='Helvetica-Bold', fontSize=9,
+        textColor=HexColor('#999999'), leading=12)))
+    story.append(Spacer(1, 3*mm))
+
+    pay_data = [
+        ['Payment', 'Amount', 'Due Date', 'Status'],
+        ['Deposit (confirmation)', f"${deposit:,.2f}", deposit_due, 'DUE'],
+        ['Balance', f"${balance:,.2f}", balance_due, 'DUE'],
+    ]
+    pay_table = Table(pay_data, colWidths=[CW*0.35, CW*0.20, CW*0.25, CW*0.20])
+    pay_table.setStyle(TableStyle([
+        ('BACKGROUND',   (0,0), (-1,0), BRAND),
+        ('TEXTCOLOR',    (0,0), (-1,0), white),
+        ('FONTNAME',     (0,0), (-1,0), 'Helvetica-Bold'),
+        ('FONTSIZE',     (0,0), (-1,-1), 9),
+        ('TOPPADDING',   (0,0), (-1,-1), 7),
+        ('BOTTOMPADDING',(0,0), (-1,-1), 7),
+        ('ALIGN',        (1,0), (-1,-1), 'RIGHT'),
+        ('GRID',         (0,0), (-1,-1), 0.5, HexColor('#E8E4DE')),
+        ('ROWBACKGROUNDS',(0,1),(-1,-1),[white, TABLE_ALT]),
+        ('FONTNAME',     (0,1), (-1,-1), 'Helvetica'),
+        ('TEXTCOLOR',    (3,1), (3,-1), ACCENT),
+        ('FONTNAME',     (3,1), (3,-1), 'Helvetica-Bold'),
+    ]))
+    story.append(pay_table)
+    story.append(Spacer(1, 6*mm))
+
+    # ── Payment Instructions ──────────────────────────────────
+    if bank_details and bank_details != '—':
+        story.append(Paragraph('PAYMENT INSTRUCTIONS', ParagraphStyle('inv_section',
+            fontName='Helvetica-Bold', fontSize=9,
+            textColor=HexColor('#999999'), leading=12)))
+        story.append(Spacer(1, 3*mm))
+        pay_inst = Table([[
+            Paragraph(
+                bank_details.replace('\n', '<br/>'),
+                ParagraphStyle('inv_bank', fontName='Helvetica',
+                    fontSize=9, textColor=EARTH, leading=14))
+        ]], colWidths=[CW])
+        pay_inst.setStyle(TableStyle([
+            ('BACKGROUND',   (0,0), (-1,-1), HexColor('#F8F6F2')),
+            ('LEFTPADDING',  (0,0), (-1,-1), 14),
+            ('RIGHTPADDING', (0,0), (-1,-1), 14),
+            ('TOPPADDING',   (0,0), (-1,-1), 12),
+            ('BOTTOMPADDING',(0,0), (-1,-1), 12),
+            ('BOX',          (0,0), (-1,-1), 1, HexColor('#E8E4DE')),
+        ]))
+        story.append(pay_inst)
+        story.append(Spacer(1, 4*mm))
+
+    # ── Terms ─────────────────────────────────────────────────
+    if cancel_terms:
+        story.append(HRFlowable(width=CW, thickness=0.5, color=HexColor('#E8E4DE')))
+        story.append(Spacer(1, 4*mm))
+        story.append(Paragraph('CANCELLATION TERMS', ParagraphStyle('inv_section',
+            fontName='Helvetica-Bold', fontSize=9,
+            textColor=HexColor('#999999'), leading=12)))
+        story.append(Spacer(1, 2*mm))
+        story.append(Paragraph(
+            cancel_terms.replace('\n', '<br/>'),
+            ParagraphStyle('inv_terms', fontName='Helvetica',
+                fontSize=8, textColor=MUTED, leading=12)))
+        story.append(Spacer(1, 3*mm))
+
+    if amendment_terms:
+        story.append(Paragraph('AMENDMENT TERMS', ParagraphStyle('inv_section',
+            fontName='Helvetica-Bold', fontSize=9,
+            textColor=HexColor('#999999'), leading=12)))
+        story.append(Spacer(1, 2*mm))
+        story.append(Paragraph(
+            amendment_terms.replace('\n', '<br/>'),
+            ParagraphStyle('inv_terms', fontName='Helvetica',
+                fontSize=8, textColor=MUTED, leading=12)))
+        story.append(Spacer(1, 4*mm))
+
+    # ── Footer ────────────────────────────────────────────────
+    footer = Table([[
+        Paragraph(
+            f"<b>{agency}</b> · {agent_email} · {agent_phone}",
+            ParagraphStyle('inv_footer', fontName='Helvetica',
+                fontSize=8, textColor=white, alignment=TA_CENTER))
+    ]], colWidths=[CW])
+    footer.setStyle(TableStyle([
+        ('BACKGROUND',   (0,0), (-1,-1), BRAND),
+        ('TOPPADDING',   (0,0), (-1,-1), 10),
+        ('BOTTOMPADDING',(0,0), (-1,-1), 10),
+    ]))
+    story.append(footer)
+
+    doc.build(story)
+
