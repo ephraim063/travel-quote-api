@@ -703,6 +703,23 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
         generate_quote_pdf(pdf_data, output_path)
         pdf_url = supabase_upload(output_path, filename)
 
+        # ── Save key quote data directly to Supabase ──────────────────────────
+        itinerary_json_payload = {
+            'pricing': {
+                'total_price_usd':    total_price,
+                'deposit_amount_usd': deposit,
+                'balance_amount_usd': balance,
+            },
+            'line_items': line_items,
+            'itinerary':  itinerary,
+        }
+        supabase_update('quotes', {'quote_number': f'eq.{quote_number}'}, {
+            'total_price_usd_cents':  int(total_price * 100),
+            'itinerary_json':         itinerary_json_payload,
+            'pdf_url':                pdf_url,
+        })
+        logger.info(f"Quote data saved to Supabase: total=${total_price}, {len(itinerary)} days")
+
         with open(output_path, 'rb') as f:
             pdf_bytes  = f.read()
             pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
