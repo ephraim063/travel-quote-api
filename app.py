@@ -939,10 +939,42 @@ def client_accept_confirm():
     quote_id = verify_token(token, 'client-accept')
     if not quote_id:
         return invalid_page()
+
+    # Update quote status to accepted
     supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {'status': 'accepted'})
     trigger_make_webhook(MAKE_S2_WEBHOOK, {'event': 'quote_accepted', 'quote_number': quote_id, 'accepted_at': int(time.time())})
     logger.info(f"Quote accepted by client: {quote_id}")
-    return success_page('&#x1F389;', 'Quote Accepted!', 'Thank you! Your safari booking is confirmed. Your travel specialist will be in touch shortly with payment details.', quote_id)
+
+    # Auto-generate invoice
+    try:
+        quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
+        if quotes:
+            quote = quotes[0]
+            agent_id = quote.get('agent_id', '')
+            if agent_id:
+                inv_payload = json.dumps({
+                    'quote_id':  quote_id,
+                    'agent_id':  agent_id,
+                }).encode('utf-8')
+                inv_req = urllib.request.Request(
+                    f"{API_BASE_URL}/generate-invoice",
+                    data=inv_payload,
+                    method='POST',
+                    headers={'Content-Type': 'application/json'}
+                )
+                with urllib.request.urlopen(inv_req, timeout=60) as resp:
+                    inv_result = json.loads(resp.read().decode())
+                logger.info(f"Invoice auto-generated: {inv_result.get('invoice_number')} for {quote_id}")
+    except Exception as e:
+        logger.error(f"Auto-invoice error for {quote_id}: {str(e)}")
+        # Don't fail the acceptance — invoice can be generated manually
+
+    return success_page(
+        '&#x1F389;',
+        'Quote Accepted!',
+        'Thank you! Your safari booking is confirmed. Your invoice has been sent to your email with payment details.',
+        quote_id
+    )
 
 
 # ─── Client Changes ───────────────────────────────────────────────────────────
@@ -1928,7 +1960,337 @@ Keep it to 3 sentences, personal and evocative. Return only the narrative text, 
         return jsonify({'error': str(e)}), 500
 
 
-# ─── Inventory Excel Upload ───────────────────────────────────────────────────
+# ─── Invoicing ────────────────────────────────────────────────────────────────
+def generate_invoice_number(agent_id):
+    """Generate sequential invoice number INV-YYYY-XXXX per agent."""
+    import datetime
+    year = datetime.date.today().year
+    existing = supabase_get('invoices', {
+        'agent_id': f'eq.{agent_id}',
+        'invoice_number': f'like.INV-{year}-%',
+        'select': 'invoice_number',
+        'order': 'created_at.desc',
+        'limit': '1',
+    })
+    if existing:
+        try:
+            last_num = int(existing[0]['invoice_number'].split('-')[-1])
+            return f"INV-{year}-{str(last_num + 1).zfill(4)}"
+        except Exception:
+            pass
+    return f"INV-{year}-0001"
+
+
+@app.route('/generate-invoice', methods=['POST'])
+def generate_invoice():
+    """Generate invoice from accepted quote."""
+    try:
+        data = request.get_json(force=True)
+        quote_id   = data.get('quote_id', '')
+        agent_id   = data.get('agent_id', '')
+
+        if not quote_id or not agent_id:
+            return jsonify({'error': 'quote_id and agent_id required'}), 400
+
+        # Fetch quote
+        quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
+        if not quotes:
+            return jsonify({'error': 'Quote not found'}), 404
+        quote = quotes[0]
+
+        # Fetch agent
+        agents = supabase_get('agents', {'id': f'eq.{agent_id}', 'select': '*'})
+        if not agents:
+            return jsonify({'error': 'Agent not found'}), 404
+        agent = agents[0]
+
+        # Calculate dates
+        import datetime
+        today = datetime.date.today()
+        deposit_pct     = float(agent.get('deposit_percentage', 30) or 30)
+        balance_days    = int(agent.get('balance_due_days', 60) or 60)
+        total_cents     = int(quote.get('total_price_usd_cents', 0) or 0)
+        deposit_cents   = int(round(total_cents * deposit_pct / 100))
+        balance_cents   = total_cents - deposit_cents
+        deposit_due     = str(today + datetime.timedelta(days=7))
+        start_date      = quote.get('start_date', '')
+        if start_date:
+            try:
+                sd = datetime.date.fromisoformat(str(start_date)[:10])
+                balance_due = str(sd - datetime.timedelta(days=balance_days))
+            except Exception:
+                balance_due = str(today + datetime.timedelta(days=30))
+        else:
+            balance_due = str(today + datetime.timedelta(days=30))
+
+        inv_number = generate_invoice_number(agent_id)
+
+        # Build line items from quote
+        line_items = quote.get('line_items', []) or []
+        if not line_items:
+            line_items = [{
+                'description': f"Safari — {quote.get('destinations', '')}",
+                'details': f"{quote.get('duration_nights', '')} nights · {quote.get('pax_adults', 2)} adults",
+                'quantity': quote.get('pax_adults', 2),
+                'unit_price': round(total_cents / 100 / max(int(quote.get('pax_adults', 2)), 1), 2),
+                'total_price': round(total_cents / 100, 2),
+            }]
+
+        # Create invoice record in Supabase
+        invoice_id = str(uuid.uuid4())
+        invoice_record = {
+            'id':                   invoice_id,
+            'invoice_number':       inv_number,
+            'quote_id':             quote_id,
+            'agent_id':             agent_id,
+            'client_name':          quote.get('client_name', ''),
+            'client_email':         quote.get('client_email', ''),
+            'client_phone':         quote.get('client_phone', ''),
+            'client_nationality':   quote.get('client_nationality', ''),
+            'destinations':         quote.get('destinations', ''),
+            'start_date':           quote.get('start_date', None),
+            'end_date':             quote.get('end_date', None),
+            'pax_adults':           int(quote.get('pax_adults', 2) or 2),
+            'pax_children':         int(quote.get('pax_children', 0) or 0),
+            'duration_nights':      int(quote.get('duration_nights', 0) or 0),
+            'subtotal_usd_cents':   total_cents,
+            'tax_usd_cents':        0,
+            'total_usd_cents':      total_cents,
+            'deposit_pct':          deposit_pct,
+            'deposit_usd_cents':    deposit_cents,
+            'balance_usd_cents':    balance_cents,
+            'amount_paid_usd_cents':0,
+            'amount_due_usd_cents': total_cents,
+            'deposit_due_date':     deposit_due,
+            'balance_due_date':     balance_due,
+            'status':               'sent',
+            'line_items':           json.dumps(line_items),
+        }
+
+        insert_url = f"{SUPABASE_URL}/rest/v1/invoices"
+        req = urllib.request.Request(
+            insert_url,
+            data=json.dumps(invoice_record).encode('utf-8'),
+            method='POST',
+            headers={
+                'Authorization': f'Bearer {SUPABASE_KEY}',
+                'apikey': SUPABASE_KEY,
+                'Content-Type': 'application/json',
+                'Prefer': 'return=minimal',
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+
+        # Generate PDF
+        from pdf_generator import generate_invoice_pdf
+        pdf_data = {
+            'agent': {
+                'agency':               agent.get('agency_name', ''),
+                'email':                agent.get('email', ''),
+                'phone':                agent.get('phone', ''),
+                'logo_url':             agent.get('logo_url', ''),
+                'brand_color_primary':  agent.get('brand_color_primary', '#2E4A7A'),
+                'brand_color_secondary':agent.get('brand_color_secondary', '#C4922A'),
+                'cancellation_terms':   agent.get('cancellation_terms', ''),
+                'amendment_terms':      agent.get('amendment_terms', ''),
+                'bank_details':         agent.get('bank_details', ''),
+                'mpesa_details':        agent.get('mpesa_details', ''),
+            },
+            'client': {
+                'name':  quote.get('client_name', ''),
+                'email': quote.get('client_email', ''),
+                'phone': quote.get('client_phone', ''),
+            },
+            'invoice': {
+                'invoice_number': inv_number,
+                'quote_id':       quote_id,
+                'issued_at':      str(today),
+                'total_usd_cents':    total_cents,
+                'deposit_usd_cents':  deposit_cents,
+                'balance_usd_cents':  balance_cents,
+                'deposit_due_date':   deposit_due,
+                'balance_due_date':   balance_due,
+                'destinations':       quote.get('destinations', ''),
+                'start_date':         str(quote.get('start_date', ''))[:10],
+                'end_date':           str(quote.get('end_date', ''))[:10],
+                'pax_adults':         int(quote.get('pax_adults', 2) or 2),
+                'pax_children':       int(quote.get('pax_children', 0) or 0),
+            },
+            'line_items': line_items,
+        }
+
+        filename    = f"SafariFlow_Invoice_{inv_number}.pdf"
+        output_path = os.path.join(OUTPUT_DIR, filename)
+        generate_invoice_pdf(pdf_data, output_path)
+
+        # Upload to Supabase storage
+        pdf_url = supabase_upload(output_path, filename)
+
+        # Update invoice with PDF URL
+        supabase_update('invoices', {'id': f'eq.{invoice_id}'}, {'pdf_url': pdf_url})
+
+        # Read PDF for email attachment
+        with open(output_path, 'rb') as f:
+            pdf_base64 = base64.b64encode(f.read()).decode('utf-8')
+
+        # Send invoice email to client
+        client_email_addr = quote.get('client_email', '')
+        if client_email_addr:
+            invoice_html = f"""
+            <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+              <div style="background:{agent.get('brand_color_primary','#2E4A7A')};padding:28px;text-align:center;color:white;border-radius:12px 12px 0 0">
+                <h1 style="margin:0;font-size:20px;letter-spacing:2px">{agent.get('agency_name','')}</h1>
+                <p style="margin:8px 0 0;opacity:0.8;font-size:12px">INVOICE</p>
+              </div>
+              <div style="background:{agent.get('brand_color_secondary','#C4922A')};height:3px"></div>
+              <div style="padding:28px;background:#ffffff">
+                <h2 style="color:#1A1A1A">Dear {quote.get('client_name','')},</h2>
+                <p style="color:#444;line-height:1.7">Please find attached your invoice <strong>{inv_number}</strong> for your upcoming safari.</p>
+                <div style="background:#F8F6F2;border-radius:8px;padding:16px;margin:20px 0">
+                  <p style="margin:0 0 8px;font-weight:bold">Payment Summary:</p>
+                  <p style="margin:4px 0;color:#444;font-size:13px">Total: <strong>${total_cents/100:,.2f}</strong></p>
+                  <p style="margin:4px 0;color:#444;font-size:13px">Deposit due by {deposit_due}: <strong>${deposit_cents/100:,.2f}</strong></p>
+                  <p style="margin:4px 0;color:#444;font-size:13px">Balance due by {balance_due}: <strong>${balance_cents/100:,.2f}</strong></p>
+                </div>
+                <p style="color:#444;font-size:13px">Please contact us if you have any questions.</p>
+                <p style="color:#444;font-size:13px">Kind regards,<br/><strong>{agent.get('agent_name','')}</strong><br/>{agent.get('agency_name','')}</p>
+              </div>
+            </div>"""
+            send_email(
+                to=client_email_addr,
+                subject=f"Invoice {inv_number} — {agent.get('agency_name','')}",
+                html=invoice_html,
+                attachments=[{'filename': filename, 'content': pdf_base64}]
+            )
+
+        # Notify agent
+        agent_email_addr = agent.get('email', '')
+        if agent_email_addr:
+            send_email(
+                to=agent_email_addr,
+                subject=f"Invoice Sent — {quote.get('client_name','')} ({inv_number})",
+                html=f"""
+                <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:28px">
+                  <h2>Invoice Sent ✅</h2>
+                  <p>Invoice <strong>{inv_number}</strong> has been sent to {quote.get('client_name','')}.</p>
+                  <p>Total: <strong>${total_cents/100:,.2f}</strong><br/>
+                  Deposit due: {deposit_due}<br/>
+                  Balance due: {balance_due}</p>
+                </div>""",
+            )
+
+        logger.info(f"Invoice generated: {inv_number} for {quote_id}")
+        return jsonify({
+            'success':        True,
+            'invoice_id':     invoice_id,
+            'invoice_number': inv_number,
+            'pdf_url':        pdf_url,
+            'total':          total_cents / 100,
+            'deposit':        deposit_cents / 100,
+            'balance':        balance_cents / 100,
+            'deposit_due':    deposit_due,
+            'balance_due':    balance_due,
+        })
+
+    except Exception as e:
+        logger.error(f"Invoice generation error: {str(e)}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/confirm-payment', methods=['POST'])
+def confirm_payment():
+    """Agent confirms a payment received."""
+    try:
+        data           = request.get_json(force=True)
+        invoice_id     = data.get('invoice_id', '')
+        agent_id       = data.get('agent_id', '')
+        payment_type   = data.get('payment_type', 'deposit')
+        payment_method = data.get('payment_method', 'bank_transfer')
+        amount_usd     = float(data.get('amount_usd', 0))
+        reference      = data.get('reference', '')
+        notes          = data.get('notes', '')
+
+        if not invoice_id or not agent_id:
+            return jsonify({'error': 'invoice_id and agent_id required'}), 400
+
+        # Fetch invoice
+        invoices = supabase_get('invoices', {'id': f'eq.{invoice_id}', 'select': '*'})
+        if not invoices:
+            return jsonify({'error': 'Invoice not found'}), 404
+        invoice = invoices[0]
+
+        amount_cents = int(amount_usd * 100)
+
+        # Record payment
+        payment_id = str(uuid.uuid4())
+        payment_record = {
+            'id':             payment_id,
+            'invoice_id':     invoice_id,
+            'agent_id':       agent_id,
+            'payment_type':   payment_type,
+            'payment_method': payment_method,
+            'amount_usd_cents': amount_cents,
+            'reference':      reference,
+            'notes':          notes,
+            'confirmed_by':   'agent',
+        }
+        insert_url = f"{SUPABASE_URL}/rest/v1/payments"
+        req = urllib.request.Request(
+            insert_url,
+            data=json.dumps(payment_record).encode('utf-8'),
+            method='POST',
+            headers={
+                'Authorization': f'Bearer {SUPABASE_KEY}',
+                'apikey': SUPABASE_KEY,
+                'Content-Type': 'application/json',
+                'Prefer': 'return=minimal',
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+
+        # Update invoice amounts and status
+        paid_so_far  = int(invoice.get('amount_paid_usd_cents', 0) or 0) + amount_cents
+        total_cents  = int(invoice.get('total_usd_cents', 0) or 0)
+        amount_due   = max(0, total_cents - paid_so_far)
+        deposit_cents = int(invoice.get('deposit_usd_cents', 0) or 0)
+
+        if paid_so_far >= total_cents:
+            new_status = 'balance_paid'
+        elif paid_so_far >= deposit_cents:
+            new_status = 'deposit_paid'
+        else:
+            new_status = invoice.get('status', 'sent')
+
+        supabase_update('invoices', {'id': f'eq.{invoice_id}'}, {
+            'amount_paid_usd_cents': paid_so_far,
+            'amount_due_usd_cents':  amount_due,
+            'status':                new_status,
+        })
+
+        # Update quote status if deposit paid
+        quote_id = invoice.get('quote_id', '')
+        if quote_id and new_status in ('deposit_paid', 'balance_paid'):
+            supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
+                'status': 'confirmed' if new_status == 'balance_paid' else 'deposit_paid'
+            })
+
+        logger.info(f"Payment confirmed: {payment_type} ${amount_usd} for invoice {invoice_id}")
+        return jsonify({
+            'success':       True,
+            'payment_id':    payment_id,
+            'new_status':    new_status,
+            'amount_paid':   paid_so_far / 100,
+            'amount_due':    amount_due / 100,
+        })
+
+    except Exception as e:
+        logger.error(f"Payment confirmation error: {str(e)}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+
 @app.route('/upload-inventory/<inventory_type>', methods=['POST'])
 def upload_inventory(inventory_type):
     """Parse uploaded Excel file and save rows to Supabase."""
