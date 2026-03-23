@@ -703,7 +703,7 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
         generate_quote_pdf(pdf_data, output_path)
         pdf_url = supabase_upload(output_path, filename)
 
-        # ── Save key quote data directly to Supabase ──────────────────────────
+        # ── Save full quote record directly to Supabase ───────────────────────
         itinerary_json_payload = {
             'pricing': {
                 'total_price_usd':    total_price,
@@ -713,12 +713,50 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
             'line_items': line_items,
             'itinerary':  itinerary,
         }
-        supabase_update('quotes', {'quote_number': f'eq.{quote_number}'}, {
-            'total_price_usd_cents':  int(total_price * 100),
-            'itinerary_json':         itinerary_json_payload,
-            'pdf_url':                pdf_url,
-        })
-        logger.info(f"Quote data saved to Supabase: total=${total_price}, {len(itinerary)} days")
+
+        quote_record = {
+            'quote_number':             quote_number,
+            'agent_id':                 agent_id,
+            'status':                   'generated',
+            'source':                   data.get('source', 'portal'),
+            'client_name':              client_name,
+            'client_email':             client_email,
+            'destinations':             destinations,
+            'start_date':               start_date[:10] if start_date else None,
+            'end_date':                 end_date[:10] if end_date else None,
+            'duration_days':            duration_days,
+            'pax_adults':               pax_adults,
+            'pax_children':             pax_children,
+            'accommodation_tier':       accommodation_tier,
+            'total_price_usd_cents':    int(total_price * 100),
+            'client_budget_usd_cents':  int(budget_usd * 100),
+            'itinerary_json':           itinerary_json_payload,
+            'pdf_url':                  pdf_url,
+            'accept_token':             client_accept_token,
+            'change_token':             client_changes_token,
+            'reject_token':             reject_token,
+            'special_requests':         special_requests,
+        }
+
+        # Try insert first — if exists update instead
+        try:
+            insert_url = f"{SUPABASE_URL}/rest/v1/quotes"
+            insert_req = urllib.request.Request(
+                insert_url,
+                data=json.dumps(quote_record).encode('utf-8'),
+                method='POST',
+                headers={
+                    'Authorization': f'Bearer {SUPABASE_KEY}',
+                    'apikey': SUPABASE_KEY,
+                    'Content-Type': 'application/json',
+                    'Prefer': 'return=minimal,resolution=merge-duplicates',
+                }
+            )
+            with urllib.request.urlopen(insert_req, timeout=15) as resp:
+                resp.read()
+            logger.info(f"Quote saved to Supabase: {quote_number}, total=${total_price}")
+        except Exception as e:
+            logger.error(f"Quote save error: {str(e)}")
 
         with open(output_path, 'rb') as f:
             pdf_bytes  = f.read()
