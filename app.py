@@ -579,6 +579,19 @@ def generate_pdf():
         budget_usd        = float(data.get('budget_usd', 10000) or 10000)
         special_requests  = data.get('special_requests', '')
 
+        # Map source to valid enum values
+        source_raw = data.get('source', 'manual')
+        source_map = {
+            'portal': 'form',
+            'tally':  'form',
+            'form':   'form',
+            'email':  'email',
+            'safaribookings': 'email',
+            'chatbot': 'chatbot',
+            'manual': 'manual',
+        }
+        intake_source = source_map.get(source_raw, 'manual')
+
         logger.info(f"Generating quote for {client_name} — {destinations}")
 
         agents   = supabase_get('agents', {'id': f'eq.{agent_id}', 'select': '*'})
@@ -717,7 +730,7 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
             'quote_number':             quote_number,
             'agent_id':                 agent_id,
             'status':                   'generated',
-            'source':                   data.get('source', 'portal'),
+            'source':                   intake_source,
             'client_name':              client_name,
             'client_email':             client_email,
             'destinations':             destinations,
@@ -762,7 +775,7 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
                     'quote_number':             quote_number,
                     'agent_id':                 agent_id,
                     'status':                   'generated',
-                    'source':                   data.get('source', 'portal'),
+                    'source':                   intake_source,
                     'client_name':              client_name,
                     'client_email':             client_email,
                     'destinations':             destinations,
