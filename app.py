@@ -1928,6 +1928,293 @@ Keep it to 3 sentences, personal and evocative. Return only the narrative text, 
         return jsonify({'error': str(e)}), 500
 
 
+# ─── Inventory Excel Upload ───────────────────────────────────────────────────
+@app.route('/upload-inventory/<inventory_type>', methods=['POST'])
+def upload_inventory(inventory_type):
+    """Parse uploaded Excel file and save rows to Supabase."""
+    try:
+        import openpyxl
+
+        agent_id = request.form.get('agent_id', '')
+        if not agent_id:
+            return jsonify({'error': 'agent_id required'}), 400
+
+        if inventory_type not in ['accommodations', 'transport', 'park_fees']:
+            return jsonify({'error': 'Invalid inventory type'}), 400
+
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
+
+        file = request.files['file']
+        if not file.filename.endswith(('.xlsx', '.xls')):
+            return jsonify({'error': 'Please upload an Excel file (.xlsx)'}), 400
+
+        # Save temp file
+        temp_path = os.path.join(OUTPUT_DIR, f'temp_{agent_id}_{inventory_type}.xlsx')
+        file.save(temp_path)
+
+        wb = openpyxl.load_workbook(temp_path, data_only=True)
+        ws = wb.active
+
+        # Find header row (row 4) and data rows (row 5+)
+        headers = []
+        for cell in ws[4]:
+            if cell.value:
+                headers.append(str(cell.value).strip())
+
+        rows_inserted = 0
+        rows_skipped  = 0
+        errors        = []
+
+        for row_num, row in enumerate(ws.iter_rows(min_row=5, values_only=True), start=5):
+            # Skip empty rows
+            if not any(row):
+                continue
+            # Skip example row if it contains example data
+            first_val = str(row[0] or '').strip()
+            if not first_val:
+                continue
+
+            try:
+                if inventory_type == 'accommodations':
+                    record = {
+                        'id':                           str(uuid.uuid4()),
+                        'agent_id':                     agent_id,
+                        'name':                         str(row[0] or '').strip(),
+                        'destination':                  str(row[1] or '').strip(),
+                        'category':                     str(row[2] or '').strip(),
+                        'room_type':                    str(row[3] or '').strip(),
+                        'meal_plan':                    str(row[4] or '').strip(),
+                        'price_per_person_usd_cents':   int(float(row[5] or 0) * 100),
+                        'child_price_per_person_usd_cents': int(float(row[6] or 0) * 100) if row[6] else None,
+                        'child_age_min':                int(row[7]) if row[7] else 2,
+                        'child_age_max':                int(row[8]) if row[8] else 12,
+                        'notes':                        str(row[9] or '').strip() or None,
+                    }
+                    if not record['name'] or not record['destination']:
+                        rows_skipped += 1
+                        continue
+                    table = 'accommodations'
+
+                elif inventory_type == 'transport':
+                    pricing_type = str(row[4] or 'per_vehicle_per_day').strip()
+                    record = {
+                        'id':                           str(uuid.uuid4()),
+                        'agent_id':                     agent_id,
+                        'transport_mode':               str(row[0] or 'Road').strip(),
+                        'from_location':                str(row[1] or '').strip(),
+                        'to_location':                  str(row[2] or '').strip(),
+                        'operator_name':                str(row[3] or '').strip(),
+                        'transport_type':               str(row[3] or '').strip(),
+                        'pricing_type':                 pricing_type,
+                        'price_per_person_usd_cents':   int(float(row[5] or 0) * 100),
+                        'child_price_per_person_usd_cents': int(float(row[6] or 0) * 100) if row[6] else None,
+                        'child_age_min':                int(row[7]) if row[7] else 2,
+                        'child_age_max':                int(row[8]) if row[8] else 12,
+                        'duration_hours':               float(row[9]) if row[9] else None,
+                        'max_passengers':               int(row[10]) if row[10] else None,
+                        'notes':                        str(row[11] or '').strip() or None,
+                    }
+                    if not record['from_location'] or not record['to_location']:
+                        rows_skipped += 1
+                        continue
+                    table = 'transport_routes'
+
+                elif inventory_type == 'park_fees':
+                    record = {
+                        'id':                               str(uuid.uuid4()),
+                        'agent_id':                         agent_id,
+                        'park_name':                        str(row[0] or '').strip(),
+                        'destination':                      str(row[1] or '').strip(),
+                        'visitor_category':                 str(row[2] or 'Non-Resident').strip(),
+                        'fee_per_person_per_day_usd_cents': int(float(row[3] or 0) * 100),
+                        'child_fee_per_person_per_day_usd_cents': int(float(row[4] or 0) * 100) if row[4] else None,
+                        'child_age_min':                    int(row[5]) if row[5] else 3,
+                        'child_age_max':                    int(row[6]) if row[6] else 17,
+                        'notes':                            str(row[7] or '').strip() or None,
+                    }
+                    if not record['park_name']:
+                        rows_skipped += 1
+                        continue
+                    table = 'park_fees'
+
+                # Insert to Supabase
+                insert_url = f"{SUPABASE_URL}/rest/v1/{table}"
+                insert_payload = json.dumps(record).encode('utf-8')
+                req = urllib.request.Request(
+                    insert_url,
+                    data=insert_payload,
+                    method='POST',
+                    headers={
+                        'Authorization': f'Bearer {SUPABASE_KEY}',
+                        'apikey': SUPABASE_KEY,
+                        'Content-Type': 'application/json',
+                        'Prefer': 'return=minimal',
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    resp.read()
+                rows_inserted += 1
+
+            except Exception as row_err:
+                errors.append(f"Row {row_num}: {str(row_err)}")
+                rows_skipped += 1
+
+        # Cleanup temp file
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+
+        logger.info(f"Inventory upload: {inventory_type}, inserted={rows_inserted}, skipped={rows_skipped}")
+        return jsonify({
+            'success': True,
+            'inventory_type': inventory_type,
+            'rows_inserted': rows_inserted,
+            'rows_skipped': rows_skipped,
+            'errors': errors[:5],
+        })
+
+    except Exception as e:
+        logger.error(f"Inventory upload error: {str(e)}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# ─── Template Downloads ───────────────────────────────────────────────────────
+@app.route('/download-template/<template_type>', methods=['GET'])
+def download_template(template_type):
+    """Generate and return an Excel inventory template."""
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        NAVY = '2E4A7A'
+        GOLD = 'C4922A'
+        EXAMPLE = 'FFF8EC'
+        LIGHT = 'EEF2F8'
+        BC = 'CCCCCC'
+
+        def side(): return Side(style='thin', color=BC)
+        def border(): return Border(left=side(), right=side(), top=side(), bottom=side())
+
+        def hdr(ws, row, col, val, width=20):
+            c = ws.cell(row=row, column=col, value=val)
+            c.font = Font(bold=True, color='FFFFFF', name='Arial', size=10)
+            c.fill = PatternFill('solid', start_color=NAVY)
+            c.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            c.border = border()
+            ws.column_dimensions[get_column_letter(col)].width = width
+
+        def ex(ws, row, col, val):
+            c = ws.cell(row=row, column=col, value=val)
+            c.font = Font(name='Arial', size=9, italic=True, color='666666')
+            c.fill = PatternFill('solid', start_color=EXAMPLE)
+            c.alignment = Alignment(vertical='center', wrap_text=True)
+            c.border = border()
+
+        def title(ws, t, sub, ncols):
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
+            c = ws.cell(row=1, column=1, value=t)
+            c.font = Font(bold=True, name='Arial', size=14, color='FFFFFF')
+            c.fill = PatternFill('solid', start_color=NAVY)
+            c.alignment = Alignment(horizontal='center', vertical='center')
+            ws.row_dimensions[1].height = 28
+            ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=ncols)
+            c2 = ws.cell(row=2, column=1, value=sub)
+            c2.font = Font(name='Arial', size=10, color=GOLD)
+            c2.fill = PatternFill('solid', start_color='F8F6F2')
+            c2.alignment = Alignment(horizontal='center', vertical='center')
+            ws.row_dimensions[2].height = 20
+            ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=ncols)
+            c3 = ws.cell(row=3, column=1,
+                value='ROW 5 IS AN EXAMPLE — Delete before uploading. Fill from row 6 onwards.')
+            c3.font = Font(bold=True, name='Arial', size=9, color='CC0000')
+            c3.fill = PatternFill('solid', start_color='FFF0F0')
+            c3.alignment = Alignment(horizontal='center', vertical='center')
+            ws.row_dimensions[3].height = 16
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.freeze_panes = 'A5'
+
+        if template_type == 'accommodations':
+            ws.title = 'Accommodations'
+            cols = [
+                ('Property Name', 22), ('Destination', 18), ('Category', 18),
+                ('Room Type', 18), ('Meal Plan', 16),
+                ('Adult Price Per Person (USD)', 22), ('Child Price Per Person (USD)', 22),
+                ('Child Age Min', 14), ('Child Age Max', 14), ('Notes', 28),
+            ]
+            title(ws, 'SafariFlow — Accommodations Template',
+                  'One row per property / room type combination.', len(cols))
+            for i, (h, w) in enumerate(cols, 1): hdr(ws, 4, i, h, w)
+            for i, v in enumerate(['Angama Mara','Masai Mara','Luxury','Tent Suite',
+                                    'Full Board',850,425,6,12,'Min 2 nights'], 1): ex(ws, 5, i, v)
+            filename = 'SafariFlow_Accommodations_Template.xlsx'
+
+        elif template_type == 'transport':
+            ws.title = 'Transport'
+            cols = [
+                ('Transport Mode', 16), ('From Location', 20), ('To Location', 20),
+                ('Operator / Vehicle Name', 24), ('Pricing Type', 26), ('Price (USD)', 16),
+                ('Child Price (USD)', 18), ('Child Age Min', 14), ('Child Age Max', 14),
+                ('Duration (Hours)', 16), ('Max Passengers', 16), ('Notes', 28),
+            ]
+            title(ws, 'SafariFlow — Transport Template',
+                  'Road = per_vehicle_per_day · Flight = per_person_per_sector · Train = per_person_per_trip',
+                  len(cols))
+            for i, (h, w) in enumerate(cols, 1): hdr(ws, 4, i, h, w)
+            examples = [
+                ['Road','Nairobi','Masai Mara','Land Cruiser 4x4','per_vehicle_per_day',200,'',2,12,6,7,'Pop-up roof'],
+                ['Flight','Nairobi (WIL)','Masai Mara (MRE)','Safarilink','per_person_per_sector',150,115,2,12,0.5,12,'Morning only'],
+                ['Train','Nairobi','Mombasa','SGR Economy','per_person_per_trip',30,15,2,12,4.5,'','Book 2wks ahead'],
+            ]
+            for r, row in enumerate(examples, 5):
+                for c, v in enumerate(row, 1): ex(ws, r, c, v)
+            filename = 'SafariFlow_Transport_Template.xlsx'
+
+        elif template_type == 'park_fees':
+            ws.title = 'Park Fees'
+            cols = [
+                ('Park / Reserve Name', 26), ('Destination / Region', 22),
+                ('Visitor Category', 24), ('Fee Per Person Per Day (USD)', 24),
+                ('Child Fee Per Day (USD)', 22), ('Child Age Min', 14),
+                ('Child Age Max', 14), ('Notes', 30),
+            ]
+            title(ws, 'SafariFlow — Park Fees Template',
+                  'One row per park per visitor category.', len(cols))
+            for i, (h, w) in enumerate(cols, 1): hdr(ws, 4, i, h, w)
+            examples = [
+                ['Masai Mara National Reserve','Masai Mara','Non-Resident',80,40,3,17,'KWS 2025'],
+                ['Masai Mara National Reserve','Masai Mara','East Africa Resident',35,20,3,17,'EAC passport required'],
+                ['Amboseli National Park','Amboseli','Non-Resident',60,30,3,17,'KWS 2025'],
+                ['Serengeti National Park','Serengeti','Non-Resident',70,35,5,17,'TANAPA 2025'],
+            ]
+            for r, row in enumerate(examples, 5):
+                for c, v in enumerate(row, 1): ex(ws, r, c, v)
+            filename = 'SafariFlow_ParkFees_Template.xlsx'
+        else:
+            return jsonify({'error': 'Invalid template type'}), 400
+
+        # Stream file back
+        from io import BytesIO
+        from flask import send_file
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=filename,
+        )
+
+    except Exception as e:
+        logger.error(f"Template download error: {str(e)}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
