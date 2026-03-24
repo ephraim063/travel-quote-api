@@ -225,7 +225,10 @@ def send_email(to, subject, html, attachments=None):
                     )
                     msg.attach(part)
 
-            with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            with smtplib.SMTP('smtp.gmail.com', 587) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
                 server.login(GMAIL_USER, GMAIL_PASSWORD)
                 server.sendmail(GMAIL_USER, to if isinstance(to, list) else [to], msg.as_string())
 
