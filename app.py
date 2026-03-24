@@ -190,8 +190,8 @@ def trigger_make_webhook(webhook_url, payload):
 
 
 # ─── Email helper — Gmail SMTP primary, Resend fallback ──────────────────────
-GMAIL_USER     = os.environ.get('GMAIL_USER', '')
-GMAIL_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD', '')
+GMAIL_USER     = os.environ.get('GMAIL_USER', 'ephraim063@gmail.com')
+GMAIL_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD', 'qubkcdmkrkwbzpjx')
 logger.info(f"Email config: Gmail={'YES' if GMAIL_USER else 'NO'}, Resend={'YES' if os.environ.get('RESEND_API_KEY') else 'NO'}")
 
 def send_email(to, subject, html, attachments=None):
