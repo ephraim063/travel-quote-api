@@ -15,13 +15,33 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import time
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify, redirect, send_file
+from flask_cors import CORS
 from pdf_generator import generate_quote_pdf
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+CORS(app, origins=[
+    'https://safariflow-portal-git-main-ephraim063s-projects.vercel.app',
+    'https://*.vercel.app',
+    'http://localhost:5173',
+    'http://localhost:3000',
+])
+
+# ─── CORS ─────────────────────────────────────────────────────────────────────
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, apikey'
+    return response
+
+@app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
+@app.route('/<path:path>', methods=['OPTIONS'])
+def handle_options(path):
+    return '', 204
 
 # ─── Environment variables ────────────────────────────────────────────────────
 SUPABASE_URL        = os.environ.get('SUPABASE_URL', '').rstrip('/')
@@ -176,11 +196,54 @@ def trigger_make_webhook(webhook_url, payload):
         return False
 
 
-# ─── Resend email helper ──────────────────────────────────────────────────────
+# ─── Email helper — Gmail SMTP primary, Resend fallback ──────────────────────
+GMAIL_USER     = os.environ.get('GMAIL_USER', '')
+GMAIL_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD', '')
+
 def send_email(to, subject, html, attachments=None):
-    """Send email via Resend API."""
+    """Send email — Gmail SMTP primary, Resend fallback."""
+
+    # ── Try Gmail SMTP first ──────────────────────────────────────────────────
+    if GMAIL_USER and GMAIL_PASSWORD:
+        try:
+            import smtplib
+            from email.mime.multipart import MIMEMultipart
+            from email.mime.text import MIMEText
+            from email.mime.base import MIMEBase
+            from email import encoders
+
+            msg = MIMEMultipart('mixed')
+            msg['From']    = GMAIL_USER
+            msg['To']      = to if isinstance(to, str) else ', '.join(to)
+            msg['Subject'] = subject
+
+            msg.attach(MIMEText(html, 'html'))
+
+            # Attachments
+            if attachments:
+                for att in attachments:
+                    part = MIMEBase('application', 'octet-stream')
+                    part.set_payload(base64.b64decode(att['content']))
+                    encoders.encode_base64(part)
+                    part.add_header(
+                        'Content-Disposition',
+                        f'attachment; filename="{att["filename"]}"'
+                    )
+                    msg.attach(part)
+
+            with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+                server.login(GMAIL_USER, GMAIL_PASSWORD)
+                server.sendmail(GMAIL_USER, to if isinstance(to, list) else [to], msg.as_string())
+
+            logger.info(f"Email sent via Gmail SMTP to {to}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Gmail SMTP error: {str(e)} — trying Resend fallback")
+
+    # ── Resend fallback ───────────────────────────────────────────────────────
     if not RESEND_API_KEY:
-        logger.warning("Resend API key not set — skipping email")
+        logger.warning("No email provider configured — skipping email")
         return False
     try:
         payload = {
@@ -206,7 +269,8 @@ def send_email(to, subject, html, attachments=None):
             logger.info(f"Email sent via Resend: {result.get('id')}")
         return True
     except urllib.error.HTTPError as e:
-        logger.error(f"Resend error: {e.code} {e.read().decode()}")
+        error_body = e.read().decode()
+        logger.error(f"Resend error: {e.code} error code: {error_body}")
         return False
     except Exception as e:
         logger.error(f"Resend error: {str(e)}")
@@ -2359,7 +2423,10 @@ def confirm_payment():
         reference      = data.get('reference', '')
         notes          = data.get('notes', '')
 
+        logger.info(f"Payment confirm request: invoice={invoice_id}, agent={agent_id}, amount=${amount_usd}, type={payment_type}")
+
         if not invoice_id or not agent_id:
+            logger.error(f"Missing fields: invoice_id={invoice_id}, agent_id={agent_id}")
             return jsonify({'error': 'invoice_id and agent_id required'}), 400
 
         # Fetch invoice
@@ -2397,8 +2464,7 @@ def confirm_payment():
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             resp.read()
-
-        # Update invoice amounts and status
+        logger.info(f"Payment record saved: {payment_id}, amount=${amount_usd}")
         paid_so_far  = int(invoice.get('amount_paid_usd_cents', 0) or 0) + amount_cents
         total_cents  = int(invoice.get('total_usd_cents', 0) or 0)
         amount_due   = max(0, total_cents - paid_so_far)
