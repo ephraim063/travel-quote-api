@@ -189,10 +189,10 @@ def trigger_make_webhook(webhook_url, payload):
         return False
 
 
-# ─── Email helper — Gmail SMTP primary, Resend fallback ──────────────────────
-BREVO_API_KEY  = os.environ.get('BREVO_API_KEY', 'bskZXdSFaT0hzGf')
-GMAIL_USER     = os.environ.get('GMAIL_USER', 'ephraim063@gmail.com')
-GMAIL_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD', 'qubkcdmkrkwbzpjx')
+# ─── Email helper ─────────────────────────────────────────────────────────────
+BREVO_API_KEY  = os.environ.get('BREVO_API_KEY', '')
+GMAIL_USER     = os.environ.get('GMAIL_USER', '')
+GMAIL_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD', '')
 logger.info(f"Email config: Brevo={'YES' if BREVO_API_KEY else 'NO'}, Resend={'YES' if os.environ.get('RESEND_API_KEY') else 'NO'}")
 
 def send_email(to, subject, html, attachments=None):
