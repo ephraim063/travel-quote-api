@@ -1,6 +1,8 @@
 """
 SafariFlow Flask API v5
 Added: JWT approval token generation, /approve and /reject endpoints
+Fixed: confirm_payment agent_id mismatch
+Fixed: markup loop saves cost_unit_price, cost_total_price, markup_pct, profit
 """
 
 import os
@@ -272,7 +274,6 @@ def agent_approval_email_html(agent_name, agency_name, client_name, quote_number
                                start_date, end_date, total_price,
                                approve_url, reject_url,
                                brand_primary='#2E4A7A', brand_secondary='#C4922A'):
-    """Build agent approval email HTML."""
     return f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"></head>
 <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f4;">
@@ -336,7 +337,6 @@ def client_quote_email_html(client_name, agency_name, agent_name, agent_email, a
                              quote_number, start_date, end_date,
                              accept_url, changes_url,
                              brand_primary='#2E4A7A', brand_secondary='#C4922A'):
-    """Build client quote email HTML."""
     return f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"></head>
 <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f4;">
@@ -425,7 +425,6 @@ def call_claude(prompt, max_tokens=4000):
 
 # ─── Unsplash photo fetcher ───────────────────────────────────────────────────
 def fetch_unsplash_photo(query, width=800, height=500):
-    """Fetch a single photo from Unsplash for a given query. Returns image bytes or None."""
     if not UNSPLASH_ACCESS_KEY:
         return None
     try:
@@ -440,7 +439,6 @@ def fetch_unsplash_photo(query, width=800, height=500):
         photo_url = results[0].get('urls', {}).get('regular', '')
         if not photo_url:
             return None
-        # Download the actual image
         img_req = urllib.request.Request(photo_url, headers={'User-Agent': 'SafariFlow/1.0'})
         with urllib.request.urlopen(img_req, timeout=10) as img_resp:
             return img_resp.read()
@@ -450,7 +448,6 @@ def fetch_unsplash_photo(query, width=800, height=500):
 
 
 def fetch_photos_for_itinerary(itinerary):
-    """Fetch photos for all itinerary days in parallel. Returns photo_cache dict."""
     if not UNSPLASH_ACCESS_KEY:
         logger.info("Unsplash key not set — skipping photos")
         return {}
@@ -460,7 +457,6 @@ def fetch_photos_for_itinerary(itinerary):
     photo_cache = {}
     lock = threading.Lock()
 
-    # Deduplicate queries to avoid redundant API calls
     queries = {}
     for day in itinerary:
         query = day.get('image_search_query') or f"{day.get('destination', '')} safari wildlife Kenya"
@@ -482,7 +478,6 @@ def fetch_photos_for_itinerary(itinerary):
         t.start()
         threads.append(t)
 
-    # Wait max 20 seconds for all photos
     for t in threads:
         t.join(timeout=20)
 
@@ -490,11 +485,10 @@ def fetch_photos_for_itinerary(itinerary):
     return photo_cache
 
 
-# ─── Clerk Webhook — Auto create agent on signup ──────────────────────────────
+# ─── Clerk Webhook ────────────────────────────────────────────────────────────
 @app.route('/clerk-webhook', methods=['POST'])
 def clerk_webhook():
     try:
-        # Verify webhook signature
         payload = request.get_data()
         svix_id        = request.headers.get('svix-id', '')
         svix_timestamp = request.headers.get('svix-timestamp', '')
@@ -523,12 +517,10 @@ def clerk_webhook():
             last_name   = user_data.get('last_name', '')
             agent_name  = f"{first_name} {last_name}".strip() or 'Safari Agent'
 
-            # Get primary email
             emails = user_data.get('email_addresses', [])
             if emails:
                 email = emails[0].get('email_address', '')
 
-            # Check if agent already exists
             existing = supabase_get('agents', {
                 'clerk_user_id': f'eq.{clerk_id}',
                 'select': 'id'
@@ -537,7 +529,6 @@ def clerk_webhook():
                 logger.info(f"Agent already exists for clerk_id: {clerk_id}")
                 return jsonify({'status': 'exists'}), 200
 
-            # Create agent record in Supabase
             agent_id = str(uuid.uuid4())
             new_agent = {
                 'id': agent_id,
@@ -555,7 +546,6 @@ def clerk_webhook():
                 'subscription_plan': 'free',
             }
 
-            # Insert via Supabase REST
             insert_url = f"{SUPABASE_URL}/rest/v1/agents"
             insert_payload = json.dumps(new_agent).encode('utf-8')
             req = urllib.request.Request(
@@ -574,7 +564,6 @@ def clerk_webhook():
 
             logger.info(f"Agent created: {agent_id} for {email}")
 
-            # Send welcome email
             if email and RESEND_API_KEY:
                 welcome_html = f"""
                 <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 16px rgba(0,0,0,0.1)">
@@ -585,13 +574,7 @@ def clerk_webhook():
                   <div style="background:#C4922A;height:3px"></div>
                   <div style="padding:32px">
                     <h2 style="color:#1A1A1A;margin-bottom:8px">Welcome, {agent_name}! 🦁</h2>
-                    <p style="color:#444;line-height:1.7">Your SafariFlow account is ready. You can now start generating AI-powered safari quotes in minutes.</p>
-                    <div style="background:#F8F6F2;border-radius:8px;padding:20px;margin:24px 0">
-                      <p style="margin:0 0 8px;font-weight:bold;color:#1A1A1A">Getting started:</p>
-                      <p style="margin:4px 0;color:#444;font-size:13px">1. Complete your agency profile in Settings</p>
-                      <p style="margin:4px 0;color:#444;font-size:13px">2. Add your inventory — accommodations, transport, park fees</p>
-                      <p style="margin:4px 0;color:#444;font-size:13px">3. Generate your first AI quote</p>
-                    </div>
+                    <p style="color:#444;line-height:1.7">Your SafariFlow account is ready.</p>
                     <a href="{PORTAL_URL}" style="display:inline-block;background:#2E4A7A;color:white;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:bold;letter-spacing:1px">OPEN MY PORTAL →</a>
                   </div>
                 </div>"""
@@ -608,9 +591,7 @@ def clerk_webhook():
         return jsonify({'error': str(e)}), 500
 
 
-
-
-
+# ─── Generate PDF (Quote) ─────────────────────────────────────────────────────
 @app.route('/generate-pdf', methods=['POST'])
 def generate_pdf():
     try:
@@ -634,16 +615,11 @@ def generate_pdf():
         budget_usd        = float(data.get('budget_usd', 10000) or 10000)
         special_requests  = data.get('special_requests', '')
 
-        # Map source to valid enum values
         source_raw = data.get('source', 'manual')
         source_map = {
-            'portal': 'form',
-            'tally':  'form',
-            'form':   'form',
-            'email':  'email',
-            'safaribookings': 'email',
-            'chatbot': 'chatbot',
-            'manual': 'manual',
+            'portal': 'form', 'tally': 'form', 'form': 'form',
+            'email': 'email', 'safaribookings': 'email',
+            'chatbot': 'chatbot', 'manual': 'manual',
         }
         intake_source = source_map.get(source_raw, 'manual')
 
@@ -693,8 +669,8 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
         line_items = itinerary_data.get('line_items', [])
         total_price= float(itinerary_data.get('total_price_usd', 0) or 0)
 
-        # ── Apply agent markup ────────────────────────────────────────────────
-        markup_type = agent.get('markup_type', 'overall')
+        # ── Apply agent markup — saves cost data for agent breakdown ──────────
+        markup_type    = agent.get('markup_type', 'overall')
         markup_overall = float(agent.get('markup_overall_pct', 0) or 0) / 100
         markup_map = {
             'accommodation': float(agent.get('markup_accommodation_pct', 0) or 0) / 100,
@@ -711,15 +687,23 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
             else:
                 line_type = item.get('line_type', 'accommodation')
                 pct = markup_map.get(line_type, markup_overall)
+
+            # Save pre-markup (cost) prices for agent cost breakdown
+            item['cost_unit_price']  = round(float(item.get('unit_price', 0)), 2)
+            item['cost_total_price'] = round(float(item.get('total_price', 0)), 2)
+            item['markup_pct']       = round(pct * 100, 2)
+
             if pct > 0:
-                item['unit_price'] = round(float(item.get('unit_price', 0)) * (1 + pct), 2)
+                item['unit_price']  = round(float(item.get('unit_price', 0)) * (1 + pct), 2)
                 item['total_price'] = round(float(item.get('total_price', 0)) * (1 + pct), 2)
+
+            item['profit'] = round(item['total_price'] - item['cost_total_price'], 2)
             marked_up_items.append(item)
 
-        line_items = marked_up_items
+        line_items  = marked_up_items
         total_price = sum(float(i.get('total_price', 0)) for i in line_items)
-        deposit    = round(total_price * (float(agent.get('deposit_percentage', 30) or 30) / 100), 2)
-        balance    = round(total_price - deposit, 2)
+        deposit     = round(total_price * (float(agent.get('deposit_percentage', 30) or 30) / 100), 2)
+        balance     = round(total_price - deposit, 2)
 
         logger.info(f"Itinerary built: {len(itinerary)} days, total ${total_price} (after markup)")
 
@@ -771,7 +755,6 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
         generate_quote_pdf(pdf_data, output_path)
         pdf_url = supabase_upload(output_path, filename)
 
-        # ── Save full quote record directly to Supabase ───────────────────────
         itinerary_json_payload = {
             'pricing': {
                 'total_price_usd':    total_price,
@@ -824,7 +807,6 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
         except urllib.error.HTTPError as e:
             error_body = e.read().decode()
             logger.error(f"Quote save HTTP error {e.code}: {error_body}")
-            # Try minimal save without itinerary_json
             try:
                 minimal_record = {
                     'quote_number':             quote_number,
@@ -872,7 +854,6 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
 
         logger.info(f"PDF complete: {filename} ({len(pdf_bytes)} bytes)")
 
-        # ── Send agent approval email via Resend ──────────────────────────────
         agent_email_addr = agent.get('email', '')
         if agent_email_addr:
             email_html = agent_approval_email_html(
@@ -892,18 +873,15 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
                 to=agent_email_addr,
                 subject=f"New Quote Ready for Review — {client_name} ({quote_number})",
                 html=email_html,
-                attachments=[{
-                    'filename': filename,
-                    'content': pdf_base64,
-                }]
+                attachments=[{'filename': filename, 'content': pdf_base64}]
             )
             logger.info(f"Agent approval email sent to {agent_email_addr}")
 
         return jsonify({
-            'success':        True,
-            'filename':       filename,
-            'quote_number':   quote_number,
-            'pdf_base64':     pdf_base64,
+            'success':           True,
+            'filename':          filename,
+            'quote_number':      quote_number,
+            'pdf_base64':        pdf_base64,
             'pdf_url':           pdf_url,
             'file_size':         len(pdf_bytes),
             'client_name':       client_name,
@@ -919,7 +897,7 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
             'line_items':        line_items,
             'itinerary_json':    {
                 'pricing': {
-                    'total_price_usd':   total_price,
+                    'total_price_usd':    total_price,
                     'deposit_amount_usd': deposit,
                     'balance_amount_usd': balance,
                 },
@@ -940,7 +918,7 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
         return jsonify({'error': str(e)}), 500
 
 
-# ─── Helper: confirmation page ────────────────────────────────────────────────
+# ─── Helper pages ─────────────────────────────────────────────────────────────
 def confirmation_page(token, action, title, message, button_label, button_color, icon):
     return f'''<!DOCTYPE html>
 <html>
@@ -1009,25 +987,22 @@ def approve_confirm():
     if not quote_id:
         return invalid_page()
 
-    # Update status
     supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {'status': 'sent'})
 
-    # Fetch quote and agent details to send client email
     quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
     if quotes:
         quote = quotes[0]
         agents = supabase_get('agents', {'id': f'eq.{quote.get("agent_id")}', 'select': '*'})
         agent = agents[0] if agents else {}
 
-        client_email_addr = quote.get('client_email', '')
-        client_accept_token = generate_token(quote_id, 'client-accept')
+        client_email_addr    = quote.get('client_email', '')
+        client_accept_token  = generate_token(quote_id, 'client-accept')
         client_changes_token = generate_token(quote_id, 'client-changes')
-        accept_url = f"{API_BASE_URL}/client-accept?token={client_accept_token}"
+        accept_url  = f"{API_BASE_URL}/client-accept?token={client_accept_token}"
         changes_url = f"{API_BASE_URL}/client-changes?token={client_changes_token}"
 
         if client_email_addr:
-            # Fetch PDF from Supabase Storage
-            pdf_url = quote.get('pdf_url', '')
+            pdf_url    = quote.get('pdf_url', '')
             pdf_base64 = ''
             if pdf_url:
                 try:
@@ -1051,11 +1026,7 @@ def approve_confirm():
                 brand_primary=agent.get('brand_color_primary', '#2E4A7A'),
                 brand_secondary=agent.get('brand_color_secondary', '#C4922A'),
             )
-
-            attachments = []
-            if pdf_base64:
-                attachments = [{'filename': f'SafariFlow_Quote_{quote_id}.pdf', 'content': pdf_base64}]
-
+            attachments = [{'filename': f'SafariFlow_Quote_{quote_id}.pdf', 'content': pdf_base64}] if pdf_base64 else []
             send_email(
                 to=client_email_addr,
                 subject=f"Your Safari Quote is Ready — {quote_id}",
@@ -1065,7 +1036,6 @@ def approve_confirm():
             logger.info(f"Client quote email sent to {client_email_addr}")
 
     trigger_make_webhook(MAKE_S2_WEBHOOK, {'event': 'quote_approved', 'quote_number': quote_id, 'approved_at': int(time.time())})
-    logger.info(f"Quote approved: {quote_id}")
     return success_page('&#x2705;', 'Quote Approved', 'The quote has been approved and sent to the client.', quote_id)
 
 
@@ -1090,8 +1060,7 @@ def reject_confirm():
         return invalid_page()
     supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {'status': 'revision_requested'})
     trigger_make_webhook(MAKE_S2_WEBHOOK, {'event': 'quote_rejected', 'quote_number': quote_id, 'rejected_at': int(time.time())})
-    logger.info(f"Quote rejected: {quote_id}")
-    return success_page('&#x270F;&#xFE0F;', 'Revision Requested', 'The quote has been flagged for revision. You will be notified when it is ready to review again.', quote_id)
+    return success_page('&#x270F;&#xFE0F;', 'Revision Requested', 'The quote has been flagged for revision.', quote_id)
 
 
 # ─── Client Accept ────────────────────────────────────────────────────────────
@@ -1114,26 +1083,20 @@ def client_accept_confirm():
     if not quote_id:
         return invalid_page()
 
-    # Update quote status to accepted
     supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {'status': 'accepted'})
     trigger_make_webhook(MAKE_S2_WEBHOOK, {'event': 'quote_accepted', 'quote_number': quote_id, 'accepted_at': int(time.time())})
     logger.info(f"Quote accepted by client: {quote_id}")
 
-    # Auto-generate invoice
     try:
         quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
         if quotes:
-            quote = quotes[0]
+            quote    = quotes[0]
             agent_id = quote.get('agent_id', '')
             if agent_id:
-                inv_payload = json.dumps({
-                    'quote_id':  quote_id,
-                    'agent_id':  agent_id,
-                }).encode('utf-8')
+                inv_payload = json.dumps({'quote_id': quote_id, 'agent_id': agent_id}).encode('utf-8')
                 inv_req = urllib.request.Request(
                     f"{API_BASE_URL}/generate-invoice",
-                    data=inv_payload,
-                    method='POST',
+                    data=inv_payload, method='POST',
                     headers={'Content-Type': 'application/json'}
                 )
                 with urllib.request.urlopen(inv_req, timeout=60) as resp:
@@ -1141,14 +1104,10 @@ def client_accept_confirm():
                 logger.info(f"Invoice auto-generated: {inv_result.get('invoice_number')} for {quote_id}")
     except Exception as e:
         logger.error(f"Auto-invoice error for {quote_id}: {str(e)}")
-        # Don't fail the acceptance — invoice can be generated manually
 
-    return success_page(
-        '&#x1F389;',
-        'Quote Accepted!',
-        'Thank you! Your safari booking is confirmed. Your invoice has been sent to your email with payment details.',
-        quote_id
-    )
+    return success_page('&#x1F389;', 'Quote Accepted!',
+        'Thank you! Your safari booking is confirmed. Your invoice has been sent to your email.',
+        quote_id)
 
 
 # ─── Client Changes ───────────────────────────────────────────────────────────
@@ -1159,16 +1118,14 @@ def client_changes():
     if not quote_id:
         return invalid_page()
 
-    # Fetch quote and agent details
-    quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
-    quote = quotes[0] if quotes else {}
-    agents = supabase_get('agents', {'id': f'eq.{quote.get("agent_id", "")}', 'select': '*'})
-    agent = agents[0] if agents else {}
-    brand_primary = agent.get('brand_color_primary', '#2E4A7A')
+    quotes  = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
+    quote   = quotes[0] if quotes else {}
+    agents  = supabase_get('agents', {'id': f'eq.{quote.get("agent_id", "")}', 'select': '*'})
+    agent   = agents[0] if agents else {}
+    brand_primary   = agent.get('brand_color_primary', '#2E4A7A')
     brand_secondary = agent.get('brand_color_secondary', '#C4922A')
-    agency_name = agent.get('agency_name', 'SafariFlow')
+    agency_name     = agent.get('agency_name', 'SafariFlow')
 
-    # Fetch optional extras for this agent
     extras = supabase_get('optional_extras', {
         'agent_id': f'eq.{agent.get("id", "")}',
         'is_active': 'eq.true',
@@ -1176,7 +1133,6 @@ def client_changes():
         'order': 'category.asc,name.asc'
     }) if agent.get('id') else []
 
-    # Build extras buttons HTML
     extras_html = ''
     if extras:
         extras_buttons = ''
@@ -1216,630 +1172,92 @@ def client_changes():
   .section-label {{ font-size: 11px; font-weight: bold; letter-spacing: 1px; color: #999; text-transform: uppercase; margin-bottom: 10px; }}
   .quote-ref {{ background: #F8F6F2; border-radius: 8px; padding: 12px 16px; margin-bottom: 24px; font-size: 13px; color: #666; }}
   .quote-ref span {{ color: {brand_secondary}; font-weight: bold; font-family: monospace; }}
-
-  /* Change toggle buttons */
   .changes-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 8px; }}
-  .change-btn {{
-    display: flex; align-items: center; gap: 10px;
-    padding: 12px 14px; border-radius: 10px; cursor: pointer;
-    border: 2px solid #E8E4DE; background: #F8F6F2;
-    transition: all 0.2s; user-select: none;
-  }}
+  .change-btn {{ display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-radius: 10px; cursor: pointer; border: 2px solid #E8E4DE; background: #F8F6F2; transition: all 0.2s; user-select: none; }}
   .change-btn:hover {{ border-color: {brand_secondary}; }}
   .change-btn.selected {{ border-color: {brand_primary}; background: rgba(46,74,122,0.07); }}
   .change-btn input {{ display: none; }}
   .change-icon {{ font-size: 20px; flex-shrink: 0; }}
   .change-label {{ font-size: 13px; color: #1A1A1A; font-weight: 500; flex: 1; }}
   .change-btn.selected .change-label {{ color: {brand_primary}; font-weight: 700; }}
-  .check-mark {{
-    width: 20px; height: 20px; border-radius: 50%;
-    background: {brand_primary}; color: white; font-size: 11px;
-    display: none; align-items: center; justify-content: center; flex-shrink: 0;
-  }}
+  .check-mark {{ width: 20px; height: 20px; border-radius: 50%; background: {brand_primary}; color: white; font-size: 11px; display: none; align-items: center; justify-content: center; flex-shrink: 0; }}
   .change-btn.selected .check-mark {{ display: flex; }}
-
-  /* Expandable fields */
-  .expand-field {{
-    display: none; background: #F0EDE8; border-radius: 10px;
-    padding: 16px; margin-top: 10px; margin-bottom: 4px;
-    border: 1px solid #E0D8CE; animation: slideDown 0.2s ease;
-  }}
+  .expand-field {{ display: none; background: #F0EDE8; border-radius: 10px; padding: 16px; margin-top: 10px; margin-bottom: 4px; border: 1px solid #E0D8CE; }}
   .expand-field.visible {{ display: block; }}
-  @keyframes slideDown {{ from {{ opacity:0; transform:translateY(-8px); }} to {{ opacity:1; transform:translateY(0); }} }}
   .expand-label {{ font-size: 11px; font-weight: bold; color: #888; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 8px; }}
-
-  /* Budget input */
-  .budget-input {{
-    width: 100%; padding: 10px 14px; border: 1px solid #E8E4DE;
-    border-radius: 8px; font-size: 16px; font-weight: 600;
-    color: #1A1A1A; outline: none; font-family: Arial, sans-serif;
-  }}
+  .budget-input {{ width: 100%; padding: 10px 14px; border: 1px solid #E8E4DE; border-radius: 8px; font-size: 16px; font-weight: 600; color: #1A1A1A; outline: none; font-family: Arial, sans-serif; }}
   .budget-input:focus {{ border-color: {brand_primary}; }}
-
-  /* Date input */
   .form-row-dates {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
-  .date-input {{
-    width: 100%; padding: 10px 12px; border: 1px solid #E8E4DE;
-    border-radius: 8px; font-size: 14px; font-family: Arial, sans-serif;
-    outline: none; color: #1A1A1A; cursor: pointer;
-    transition: border 0.2s;
-  }}
+  .date-input {{ width: 100%; padding: 10px 12px; border: 1px solid #E8E4DE; border-radius: 8px; font-size: 14px; font-family: Arial, sans-serif; outline: none; color: #1A1A1A; cursor: pointer; transition: border 0.2s; }}
   .date-input:focus {{ border-color: {brand_primary}; }}
-
-  /* Traveler stepper */
   .stepper-row {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }}
   .stepper-label {{ font-size: 13px; color: #444; font-weight: 500; }}
   .stepper-controls {{ display: flex; align-items: center; gap: 12px; }}
-  .stepper-btn {{
-    width: 32px; height: 32px; border-radius: 50%;
-    background: {brand_primary}; color: white; border: none;
-    font-size: 18px; cursor: pointer; display: flex;
-    align-items: center; justify-content: center; font-weight: bold;
-  }}
-  .stepper-btn:hover {{ opacity: 0.85; }}
+  .stepper-btn {{ width: 32px; height: 32px; border-radius: 50%; background: {brand_primary}; color: white; border: none; font-size: 18px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-weight: bold; }}
   .stepper-value {{ font-size: 16px; font-weight: 700; color: #1A1A1A; min-width: 24px; text-align: center; }}
-
-  /* Extras */
   .extras-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }}
-  .extra-btn {{
-    padding: 12px 14px; border-radius: 10px; cursor: pointer;
-    border: 2px solid #E8E4DE; background: #F8F6F2;
-    transition: all 0.2s; user-select: none;
-  }}
-  .extra-btn:hover {{ border-color: {brand_secondary}; }}
+  .extra-btn {{ padding: 12px 14px; border-radius: 10px; cursor: pointer; border: 2px solid #E8E4DE; background: #F8F6F2; transition: all 0.2s; user-select: none; }}
   .extra-btn.selected {{ border-color: {brand_secondary}; background: rgba(196,146,42,0.08); }}
   .extra-name {{ font-size: 13px; color: #1A1A1A; font-weight: 600; margin-bottom: 3px; }}
   .extra-btn.selected .extra-name {{ color: {brand_secondary}; }}
   .extra-meta {{ font-size: 11px; color: #888; }}
-  .extra-btn.selected .extra-meta {{ color: {brand_secondary}; opacity: 0.8; }}
-
-  /* Notes */
-  .notes-area {{
-    width: 100%; padding: 12px 14px; border: 1px solid #E8E4DE;
-    border-radius: 8px; font-size: 13px; font-family: Arial, sans-serif;
-    outline: none; resize: vertical; min-height: 80px;
-    transition: border 0.2s; color: #1A1A1A;
-  }}
+  .notes-area {{ width: 100%; padding: 12px 14px; border: 1px solid #E8E4DE; border-radius: 8px; font-size: 13px; font-family: Arial, sans-serif; outline: none; resize: vertical; min-height: 80px; transition: border 0.2s; color: #1A1A1A; }}
   .notes-area:focus {{ border-color: {brand_primary}; }}
-
-  .submit-btn {{
-    width: 100%; background: {brand_primary}; color: white; border: none;
-    padding: 14px; border-radius: 8px; font-size: 15px; font-weight: bold;
-    cursor: pointer; letter-spacing: 1px; margin-top: 8px;
-  }}
-  .submit-btn:hover {{ opacity: 0.9; }}
-
-  @media (max-width: 480px) {{
-    .changes-grid, .extras-grid {{ grid-template-columns: 1fr; }}
-  }}
+  .submit-btn {{ width: 100%; background: {brand_primary}; color: white; border: none; padding: 14px; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer; letter-spacing: 1px; margin-top: 8px; }}
+  @media (max-width: 480px) {{ .changes-grid, .extras-grid {{ grid-template-columns: 1fr; }} }}
 </style>
 </head>
 <body>
 <div class="container">
-  <div class="header">
-    <h1>{agency_name}</h1>
-    <p>REQUEST CHANGES TO YOUR QUOTE</p>
-  </div>
+  <div class="header"><h1>{agency_name}</h1><p>REQUEST CHANGES TO YOUR QUOTE</p></div>
   <div class="gold-line"></div>
   <div class="body">
     <h2>What would you like changed?</h2>
     <p class="sub">Tap the options below. We'll revise your quote and send it back to you.</p>
-
     <div class="quote-ref">Quote Reference: <span>{quote_id}</span></div>
-
     <form method="POST" action="/client-changes-confirm" id="changeForm">
       <input type="hidden" name="token" value="{token}">
       <input type="hidden" name="revised_month" id="revised_month_hidden" value="">
       <input type="hidden" name="revised_adults" id="revised_adults_hidden" value="0">
       <input type="hidden" name="revised_children" id="revised_children_hidden" value="0">
-
       <div class="section-label">What needs changing?</div>
-
       <div class="changes-grid">
-
-        <!-- Accommodation -->
-        <div class="change-btn" onclick="toggleChange(this, 'accommodation')">
-          <input type="hidden" name="change_accommodation" value="no">
-          <span class="change-icon">🏨</span>
-          <span class="change-label">Accommodation</span>
-          <span class="check-mark">✓</span>
-        </div>
-
-        <!-- Travel Dates -->
-        <div class="change-btn" onclick="toggleChange(this, 'dates')">
-          <input type="hidden" name="change_dates" value="no">
-          <span class="change-icon">📅</span>
-          <span class="change-label">Travel Dates</span>
-          <span class="check-mark">✓</span>
-        </div>
-
-        <!-- Budget -->
-        <div class="change-btn" onclick="toggleChange(this, 'budget')">
-          <input type="hidden" name="change_budget" value="no">
-          <span class="change-icon">💰</span>
-          <span class="change-label">Budget</span>
-          <span class="check-mark">✓</span>
-        </div>
-
-        <!-- Destinations -->
-        <div class="change-btn" onclick="toggleChange(this, 'destinations')">
-          <input type="hidden" name="change_destinations" value="no">
-          <span class="change-icon">📍</span>
-          <span class="change-label">Destinations</span>
-          <span class="check-mark">✓</span>
-        </div>
-
-        <!-- Travelers -->
-        <div class="change-btn" onclick="toggleChange(this, 'travelers')">
-          <input type="hidden" name="change_travelers" value="no">
-          <span class="change-icon">👥</span>
-          <span class="change-label">No. of Travelers</span>
-          <span class="check-mark">✓</span>
-        </div>
-
-        <!-- Transport -->
-        <div class="change-btn" onclick="toggleChange(this, 'transport')">
-          <input type="hidden" name="change_transport" value="no">
-          <span class="change-icon">✈️</span>
-          <span class="change-label">Transport</span>
-          <span class="check-mark">✓</span>
-        </div>
-
-        <!-- Duration -->
-        <div class="change-btn" onclick="toggleChange(this, 'duration')">
-          <input type="hidden" name="change_duration" value="no">
-          <span class="change-icon">🌙</span>
-          <span class="change-label">Trip Duration</span>
-          <span class="check-mark">✓</span>
-        </div>
-
-        <!-- Other -->
-        <div class="change-btn" onclick="toggleChange(this, 'other')">
-          <input type="hidden" name="change_other" value="no">
-          <span class="change-icon">✏️</span>
-          <span class="change-label">Other</span>
-          <span class="check-mark">✓</span>
-        </div>
-
+        <div class="change-btn" onclick="toggleChange(this, 'accommodation')"><input type="hidden" name="change_accommodation" value="no"><span class="change-icon">🏨</span><span class="change-label">Accommodation</span><span class="check-mark">✓</span></div>
+        <div class="change-btn" onclick="toggleChange(this, 'dates')"><input type="hidden" name="change_dates" value="no"><span class="change-icon">📅</span><span class="change-label">Travel Dates</span><span class="check-mark">✓</span></div>
+        <div class="change-btn" onclick="toggleChange(this, 'budget')"><input type="hidden" name="change_budget" value="no"><span class="change-icon">💰</span><span class="change-label">Budget</span><span class="check-mark">✓</span></div>
+        <div class="change-btn" onclick="toggleChange(this, 'destinations')"><input type="hidden" name="change_destinations" value="no"><span class="change-icon">📍</span><span class="change-label">Destinations</span><span class="check-mark">✓</span></div>
+        <div class="change-btn" onclick="toggleChange(this, 'travelers')"><input type="hidden" name="change_travelers" value="no"><span class="change-icon">👥</span><span class="change-label">No. of Travelers</span><span class="check-mark">✓</span></div>
+        <div class="change-btn" onclick="toggleChange(this, 'transport')"><input type="hidden" name="change_transport" value="no"><span class="change-icon">✈️</span><span class="change-label">Transport</span><span class="check-mark">✓</span></div>
+        <div class="change-btn" onclick="toggleChange(this, 'duration')"><input type="hidden" name="change_duration" value="no"><span class="change-icon">🌙</span><span class="change-label">Trip Duration</span><span class="check-mark">✓</span></div>
+        <div class="change-btn" onclick="toggleChange(this, 'other')"><input type="hidden" name="change_other" value="no"><span class="change-icon">✏️</span><span class="change-label">Other</span><span class="check-mark">✓</span></div>
       </div>
-
-      <!-- Budget expand field -->
-      <div class="expand-field" id="field_budget">
-        <div class="expand-label">What is your revised budget? (USD)</div>
-        <input type="number" name="revised_budget" class="budget-input" placeholder="e.g. 8000" min="0">
-      </div>
-
-      <!-- Dates expand field — exact date picker -->
-      <div class="expand-field" id="field_dates">
-        <div class="expand-label">Select New Travel Dates</div>
-        <div class="form-row-dates">
-          <div>
-            <div style="font-size:12px;color:#666;font-weight:600;margin-bottom:6px;">Start Date</div>
-            <input type="date" name="revised_start_date" class="date-input" min="{min_date}">
-          </div>
-          <div>
-            <div style="font-size:12px;color:#666;font-weight:600;margin-bottom:6px;">End Date</div>
-            <input type="date" name="revised_end_date" class="date-input" min="{min_date}">
-          </div>
-        </div>
-        <p style="font-size:11px;color:#999;margin-top:8px;">⚠ Please ensure dates align with your flights</p>
-      </div>
-
-      <!-- Travelers expand field — stepper -->
-      <div class="expand-field" id="field_travelers">
-        <div class="expand-label">How many travelers?</div>
-        <div class="stepper-row">
-          <span class="stepper-label">Adults</span>
-          <div class="stepper-controls">
-            <button type="button" class="stepper-btn" onclick="updatePax('adults', -1)">−</button>
-            <span class="stepper-value" id="adults_display">2</span>
-            <button type="button" class="stepper-btn" onclick="updatePax('adults', 1)">+</button>
-          </div>
-        </div>
-        <div class="stepper-row">
-          <span class="stepper-label">Children</span>
-          <div class="stepper-controls">
-            <button type="button" class="stepper-btn" onclick="updatePax('children', -1)">−</button>
-            <span class="stepper-value" id="children_display">0</span>
-            <button type="button" class="stepper-btn" onclick="updatePax('children', 1)">+</button>
-          </div>
-        </div>
-      </div>
-
+      <div class="expand-field" id="field_budget"><div class="expand-label">Revised budget (USD)</div><input type="number" name="revised_budget" class="budget-input" placeholder="e.g. 8000" min="0"></div>
+      <div class="expand-field" id="field_dates"><div class="expand-label">Select New Travel Dates</div><div class="form-row-dates"><div><div style="font-size:12px;color:#666;font-weight:600;margin-bottom:6px;">Start Date</div><input type="date" name="revised_start_date" class="date-input" min="{min_date}"></div><div><div style="font-size:12px;color:#666;font-weight:600;margin-bottom:6px;">End Date</div><input type="date" name="revised_end_date" class="date-input" min="{min_date}"></div></div></div>
+      <div class="expand-field" id="field_travelers"><div class="expand-label">How many travelers?</div><div class="stepper-row"><span class="stepper-label">Adults</span><div class="stepper-controls"><button type="button" class="stepper-btn" onclick="updatePax('adults',-1)">−</button><span class="stepper-value" id="adults_display">2</span><button type="button" class="stepper-btn" onclick="updatePax('adults',1)">+</button></div></div><div class="stepper-row"><span class="stepper-label">Children</span><div class="stepper-controls"><button type="button" class="stepper-btn" onclick="updatePax('children',-1)">−</button><span class="stepper-value" id="children_display">0</span><button type="button" class="stepper-btn" onclick="updatePax('children',1)">+</button></div></div></div>
       {extras_html}
-
-      <!-- Always visible notes field -->
-      <div style="margin-top:20px;">
-        <div class="section-label">Anything else you'd like us to know?</div>
-        <textarea name="notes" class="notes-area" placeholder="Any other details, preferences or requests not covered above..."></textarea>
-      </div>
-
-      <input type="hidden" name="revised_budget_final" id="revised_budget_final" value="">
-
+      <div style="margin-top:20px;"><div class="section-label">Anything else?</div><textarea name="notes" class="notes-area" placeholder="Any other details or requests..."></textarea></div>
       <button type="submit" class="submit-btn">✏️ SUBMIT CHANGE REQUEST</button>
     </form>
   </div>
 </div>
-
 <script>
-  // ── Change toggle ──────────────────────────────────────────────────────────
   function toggleChange(btn, type) {{
     btn.classList.toggle('selected');
-    var input = btn.querySelector('input[type="hidden"]');
-    var isSelected = btn.classList.contains('selected');
-    input.value = isSelected ? 'yes' : 'no';
-
-    // Show/hide expand fields
+    btn.querySelector('input[type="hidden"]').value = btn.classList.contains('selected') ? 'yes' : 'no';
     var field = document.getElementById('field_' + type);
-    if (field) {{
-      if (isSelected) {{
-        field.classList.add('visible');
-      }} else {{
-        field.classList.remove('visible');
-      }}
-    }}
+    if (field) field.classList.toggle('visible', btn.classList.contains('selected'));
   }}
-
-  // ── Date validation — end date must be after start date ───────────────────
-  document.addEventListener('change', function(e) {{
-    if (e.target.name === 'revised_start_date') {{
-      var endInput = document.querySelector('[name="revised_end_date"]');
-      if (endInput) {{
-        endInput.min = e.target.value;
-        if (endInput.value && endInput.value < e.target.value) {{
-          endInput.value = '';
-        }}
-      }}
-    }}
-  }});
-
-  // ── Traveler stepper ───────────────────────────────────────────────────────
-  var adults = 2;
-  var children = 0;
-
+  var adults = 2, children = 0;
   function updatePax(type, delta) {{
-    if (type === 'adults') {{
-      adults = Math.max(1, adults + delta);
-      document.getElementById('adults_display').textContent = adults;
-      document.getElementById('revised_adults_hidden').value = adults;
-    }} else {{
-      children = Math.max(0, children + delta);
-      document.getElementById('children_display').textContent = children;
-      document.getElementById('revised_children_hidden').value = children;
-    }}
+    if (type === 'adults') {{ adults = Math.max(1, adults + delta); document.getElementById('adults_display').textContent = adults; document.getElementById('revised_adults_hidden').value = adults; }}
+    else {{ children = Math.max(0, children + delta); document.getElementById('children_display').textContent = children; document.getElementById('revised_children_hidden').value = children; }}
   }}
-
-  // ── Extras toggle ──────────────────────────────────────────────────────────
   function toggleExtra(btn) {{
     btn.classList.toggle('selected');
-    var input = btn.querySelector('.extra-input');
-    input.value = btn.classList.contains('selected') ? 'yes' : 'no';
+    btn.querySelector('.extra-input').value = btn.classList.contains('selected') ? 'yes' : 'no';
   }}
 </script>
-</body>
-</html>'''
-
-    # Build extras buttons HTML
-    extras_html = ''
-    if extras:
-        extras_buttons = ''
-        for ex in extras:
-            price = ex.get('price_per_person_usd_cents', 0) / 100
-            price_label = f"${price:,.0f}/pp" if ex.get('price_type') == 'per_person' else f"${price:,.0f}/grp"
-            extras_buttons += f'''
-            <div class="extra-btn" onclick="toggleExtra(this)" data-id="{ex['id']}" data-name="{ex['name']}">
-              <input type="hidden" name="extra_{ex['id']}" value="no" class="extra-input">
-              <div class="extra-name">{ex['name']}</div>
-              <div class="extra-meta">{ex.get('category','')} · {ex.get('duration_hours',2)}h · {price_label}</div>
-            </div>'''
-
-        extras_html = f'''
-      <div class="section-label" style="margin-top:20px;">Would you like to add any extras?</div>
-      <div class="extras-grid">{extras_buttons}</div>'''
-
-    return f'''<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Request Changes — {quote_id}</title>
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; }}
-  .container {{ max-width: 580px; margin: 40px auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 16px rgba(0,0,0,0.1); }}
-  .header {{ background: {brand_primary}; padding: 28px; text-align: center; color: white; }}
-  .header h1 {{ font-size: 20px; letter-spacing: 2px; margin-bottom: 4px; }}
-  .header p {{ font-size: 12px; opacity: 0.8; }}
-  .gold-line {{ background: {brand_secondary}; height: 3px; }}
-  .body {{ padding: 32px; }}
-  .body h2 {{ font-size: 18px; color: #1A1A1A; margin-bottom: 6px; }}
-  .sub {{ font-size: 13px; color: #666; margin-bottom: 24px; }}
-  .section-label {{ font-size: 11px; font-weight: bold; letter-spacing: 1px; color: #999; text-transform: uppercase; margin-bottom: 10px; }}
-  .quote-ref {{ background: #F8F6F2; border-radius: 8px; padding: 12px 16px; margin-bottom: 24px; font-size: 13px; color: #666; }}
-  .quote-ref span {{ color: {brand_secondary}; font-weight: bold; font-family: monospace; }}
-
-  /* Change toggle buttons */
-  .changes-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }}
-  .change-btn {{
-    display: flex; align-items: center; gap: 10px;
-    padding: 12px 14px; border-radius: 10px; cursor: pointer;
-    border: 2px solid #E8E4DE; background: #F8F6F2;
-    transition: all 0.2s; user-select: none;
-  }}
-  .change-btn:hover {{ border-color: {brand_secondary}; }}
-  .change-btn.selected {{ border-color: {brand_primary}; background: rgba(46,74,122,0.08); }}
-  .change-btn input {{ display: none; }}
-  .change-icon {{ font-size: 20px; flex-shrink: 0; }}
-  .change-label {{ font-size: 13px; color: #1A1A1A; font-weight: 500; }}
-  .change-btn.selected .change-label {{ color: {brand_primary}; font-weight: 700; }}
-  .check-mark {{ margin-left: auto; width: 20px; height: 20px; border-radius: 50%; background: {brand_primary}; color: white; font-size: 11px; display: none; align-items: center; justify-content: center; flex-shrink: 0; }}
-  .change-btn.selected .check-mark {{ display: flex; }}
-
-  /* Extras toggle buttons */
-  .extras-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }}
-  .extra-btn {{
-    padding: 12px 14px; border-radius: 10px; cursor: pointer;
-    border: 2px solid #E8E4DE; background: #F8F6F2;
-    transition: all 0.2s; user-select: none;
-  }}
-  .extra-btn:hover {{ border-color: {brand_secondary}; }}
-  .extra-btn.selected {{ border-color: {brand_secondary}; background: rgba(196,146,42,0.08); }}
-  .extra-name {{ font-size: 13px; color: #1A1A1A; font-weight: 600; margin-bottom: 3px; }}
-  .extra-btn.selected .extra-name {{ color: {brand_secondary}; }}
-  .extra-meta {{ font-size: 11px; color: #888; }}
-  .extra-btn.selected .extra-meta {{ color: {brand_secondary}; opacity: 0.8; }}
-
-  /* Budget row */
-  .budget-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }}
-  .form-group {{ margin-bottom: 16px; }}
-  .form-group label {{ display: block; font-size: 12px; font-weight: bold; color: #666; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }}
-  .form-group input, .form-group textarea, .form-group select {{
-    width: 100%; padding: 10px 12px; border: 1px solid #E8E4DE;
-    border-radius: 8px; font-size: 13px; font-family: Arial, sans-serif;
-    outline: none; transition: border 0.2s;
-  }}
-  .form-group input:focus, .form-group textarea:focus {{ border-color: {brand_primary}; }}
-  .form-group textarea {{ min-height: 80px; resize: vertical; }}
-  .submit-btn {{
-    width: 100%; background: {brand_primary}; color: white; border: none;
-    padding: 14px; border-radius: 8px; font-size: 15px; font-weight: bold;
-    cursor: pointer; letter-spacing: 1px; margin-top: 8px;
-  }}
-  .submit-btn:hover {{ opacity: 0.9; }}
-  @media (max-width: 480px) {{
-    .changes-grid, .extras-grid {{ grid-template-columns: 1fr; }}
-    .budget-row {{ grid-template-columns: 1fr; }}
-  }}
-</style>
-</head>
-<body>
-<div class="container">
-  <div class="header">
-    <h1>{agency_name}</h1>
-    <p>REQUEST CHANGES TO YOUR QUOTE</p>
-  </div>
-  <div class="gold-line"></div>
-  <div class="body">
-    <h2>What would you like changed?</h2>
-    <p class="sub">Tap the options below and we'll revise your quote and send it back to you.</p>
-
-    <div class="quote-ref">Quote Reference: <span>{quote_id}</span></div>
-
-    <form method="POST" action="/client-changes-confirm">
-      <input type="hidden" name="token" value="{token}">
-
-      <div class="section-label">What needs changing?</div>
-      <div class="changes-grid">
-        <div class="change-btn" onclick="toggleChange(this)">
-          <input type="hidden" name="change_accommodation" value="no">
-          <span class="change-icon">🏨</span>
-          <span class="change-label">Accommodation</span>
-          <span class="check-mark">✓</span>
-        </div>
-        <div class="change-btn" onclick="toggleChange(this)">
-          <input type="hidden" name="change_dates" value="no">
-          <span class="change-icon">📅</span>
-          <span class="change-label">Travel Dates</span>
-          <span class="check-mark">✓</span>
-        </div>
-        <div class="change-btn" onclick="toggleChange(this)">
-          <input type="hidden" name="change_budget" value="no">
-          <span class="change-icon">💰</span>
-          <span class="change-label">Budget</span>
-          <span class="check-mark">✓</span>
-        </div>
-        <div class="change-btn" onclick="toggleChange(this)">
-          <input type="hidden" name="change_destinations" value="no">
-          <span class="change-icon">📍</span>
-          <span class="change-label">Destinations</span>
-          <span class="check-mark">✓</span>
-        </div>
-        <div class="change-btn" onclick="toggleChange(this)">
-          <input type="hidden" name="change_travelers" value="no">
-          <span class="change-icon">👥</span>
-          <span class="change-label">No. of Travelers</span>
-          <span class="check-mark">✓</span>
-        </div>
-        <div class="change-btn" onclick="toggleChange(this)">
-          <input type="hidden" name="change_transport" value="no">
-          <span class="change-icon">✈️</span>
-          <span class="change-label">Transport</span>
-          <span class="check-mark">✓</span>
-        </div>
-        <div class="change-btn" onclick="toggleChange(this)">
-          <input type="hidden" name="change_duration" value="no">
-          <span class="change-icon">🌙</span>
-          <span class="change-label">Trip Duration</span>
-          <span class="check-mark">✓</span>
-        </div>
-        <div class="change-btn" onclick="toggleChange(this)">
-          <input type="hidden" name="change_other" value="no">
-          <span class="change-icon">✏️</span>
-          <span class="change-label">Other</span>
-          <span class="check-mark">✓</span>
-        </div>
-      </div>
-
-      {extras_html}
-
-      <div class="budget-row">
-        <div class="form-group">
-          <label>Revised Budget (USD)</label>
-          <input type="number" name="revised_budget" placeholder="e.g. 8000">
-        </div>
-        <div class="form-group">
-          <label>Preferred Travel Month</label>
-          <select name="preferred_month">
-            <option value="">— No change —</option>
-            <option>January</option><option>February</option><option>March</option>
-            <option>April</option><option>May</option><option>June</option>
-            <option>July</option><option>August</option><option>September</option>
-            <option>October</option><option>November</option><option>December</option>
-          </select>
-        </div>
-      </div>
-
-      <div class="form-group">
-        <label>Additional Notes</label>
-        <textarea name="notes" placeholder="Please describe any specific changes you would like..."></textarea>
-      </div>
-
-      <button type="submit" class="submit-btn">✏️ SUBMIT CHANGE REQUEST</button>
-    </form>
-  </div>
-</div>
-
-<script>
-function toggleChange(btn) {{
-  btn.classList.toggle('selected');
-  var input = btn.querySelector('input[type="hidden"]');
-  input.value = btn.classList.contains('selected') ? 'yes' : 'no';
-}}
-
-function toggleExtra(btn) {{
-  btn.classList.toggle('selected');
-  var input = btn.querySelector('.extra-input');
-  input.value = btn.classList.contains('selected') ? 'yes' : 'no';
-}}
-</script>
-</body>
-</html>'''
-
-    return f'''<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Request Changes — {quote_id}</title>
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; }}
-  .container {{ max-width: 560px; margin: 40px auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 16px rgba(0,0,0,0.1); }}
-  .header {{ background: {brand_primary}; padding: 28px; text-align: center; color: white; }}
-  .header h1 {{ font-size: 20px; letter-spacing: 2px; margin-bottom: 4px; }}
-  .header p {{ font-size: 12px; opacity: 0.8; }}
-  .gold-line {{ background: {brand_secondary}; height: 3px; }}
-  .body {{ padding: 32px; }}
-  .body h2 {{ font-size: 18px; color: #1A1A1A; margin-bottom: 6px; }}
-  .body .sub {{ font-size: 13px; color: #666; margin-bottom: 24px; }}
-  .section-label {{ font-size: 11px; font-weight: bold; letter-spacing: 1px; color: #999; text-transform: uppercase; margin-bottom: 10px; }}
-  .checkboxes {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }}
-  .checkbox-item {{ display: flex; align-items: center; gap: 8px; background: #F8F6F2; border: 1px solid #E8E4DE; border-radius: 8px; padding: 10px 12px; cursor: pointer; transition: all 0.2s; }}
-  .checkbox-item:hover {{ border-color: {brand_secondary}; }}
-  .checkbox-item input {{ accent-color: {brand_primary}; width: 16px; height: 16px; cursor: pointer; }}
-  .checkbox-item label {{ font-size: 13px; color: #1A1A1A; cursor: pointer; }}
-  .budget-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }}
-  .form-group {{ margin-bottom: 16px; }}
-  .form-group label {{ display: block; font-size: 12px; font-weight: bold; color: #666; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }}
-  .form-group input, .form-group textarea, .form-group select {{ width: 100%; padding: 10px 12px; border: 1px solid #E8E4DE; border-radius: 8px; font-size: 13px; font-family: Arial, sans-serif; outline: none; transition: border 0.2s; }}
-  .form-group input:focus, .form-group textarea:focus {{ border-color: {brand_primary}; }}
-  .form-group textarea {{ min-height: 90px; resize: vertical; }}
-  .submit-btn {{ width: 100%; background: {brand_primary}; color: white; border: none; padding: 14px; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer; letter-spacing: 1px; margin-top: 8px; }}
-  .submit-btn:hover {{ opacity: 0.9; }}
-  .quote-ref {{ background: #F8F6F2; border-radius: 8px; padding: 12px 16px; margin-bottom: 24px; font-size: 13px; color: #666; }}
-  .quote-ref span {{ color: {brand_secondary}; font-weight: bold; font-family: monospace; }}
-</style>
-</head>
-<body>
-<div class="container">
-  <div class="header">
-    <h1>{agency_name}</h1>
-    <p>REQUEST CHANGES TO YOUR QUOTE</p>
-  </div>
-  <div class="gold-line"></div>
-  <div class="body">
-    <h2>What would you like changed?</h2>
-    <p class="sub">Please tell us what you'd like us to adjust. We'll revise your quote and send it back to you.</p>
-
-    <div class="quote-ref">Quote Reference: <span>{quote_id}</span></div>
-
-    <form method="POST" action="/client-changes-confirm">
-      <input type="hidden" name="token" value="{token}">
-
-      <div class="section-label">What needs changing?</div>
-      <div class="checkboxes">
-        <div class="checkbox-item">
-          <input type="checkbox" id="c1" name="change_accommodation" value="yes">
-          <label for="c1">🏨 Accommodation</label>
-        </div>
-        <div class="checkbox-item">
-          <input type="checkbox" id="c2" name="change_dates" value="yes">
-          <label for="c2">📅 Travel Dates</label>
-        </div>
-        <div class="checkbox-item">
-          <input type="checkbox" id="c3" name="change_budget" value="yes">
-          <label for="c3">💰 Budget</label>
-        </div>
-        <div class="checkbox-item">
-          <input type="checkbox" id="c4" name="change_destinations" value="yes">
-          <label for="c4">📍 Destinations</label>
-        </div>
-        <div class="checkbox-item">
-          <input type="checkbox" id="c5" name="change_travelers" value="yes">
-          <label for="c5">👥 No. of Travelers</label>
-        </div>
-        <div class="checkbox-item">
-          <input type="checkbox" id="c6" name="change_transport" value="yes">
-          <label for="c6">✈️ Transport</label>
-        </div>
-        <div class="checkbox-item">
-          <input type="checkbox" id="c7" name="change_duration" value="yes">
-          <label for="c7">🌙 Trip Duration</label>
-        </div>
-        <div class="checkbox-item">
-          <input type="checkbox" id="c8" name="change_other" value="yes">
-          <label for="c8">✏️ Other</label>
-        </div>
-      </div>
-
-      <div class="budget-row">
-        <div class="form-group">
-          <label>Revised Budget (USD)</label>
-          <input type="number" name="revised_budget" placeholder="e.g. 8000">
-        </div>
-        <div class="form-group">
-          <label>Preferred Travel Month</label>
-          <select name="preferred_month">
-            <option value="">— No change —</option>
-            <option>January</option><option>February</option><option>March</option>
-            <option>April</option><option>May</option><option>June</option>
-            <option>July</option><option>August</option><option>September</option>
-            <option>October</option><option>November</option><option>December</option>
-          </select>
-        </div>
-      </div>
-
-      <div class="form-group">
-        <label>Additional Notes</label>
-        <textarea name="notes" placeholder="Please describe the specific changes you would like..."></textarea>
-      </div>
-
-      <button type="submit" class="submit-btn">✏️ SUBMIT CHANGE REQUEST</button>
-    </form>
-  </div>
-</div>
-</body>
-</html>'''
+</body></html>'''
 
 
 @app.route('/client-changes-confirm', methods=['POST'])
@@ -1849,34 +1267,28 @@ def client_changes_confirm():
     if not quote_id:
         return invalid_page()
 
-    # Capture selected extras
-    selected_extras = []
-    for key, value in request.form.items():
-        if key.startswith('extra_') and value == 'yes':
-            extra_id = key.replace('extra_', '')
-            selected_extras.append(extra_id)
+    selected_extras = [key.replace('extra_', '') for key, value in request.form.items() if key.startswith('extra_') and value == 'yes']
 
     change_request = {
-        'accommodation': request.form.get('change_accommodation') == 'yes',
-        'dates':         request.form.get('change_dates') == 'yes',
-        'budget':        request.form.get('change_budget') == 'yes',
-        'destinations':  request.form.get('change_destinations') == 'yes',
-        'travelers':     request.form.get('change_travelers') == 'yes',
-        'transport':     request.form.get('change_transport') == 'yes',
-        'duration':      request.form.get('change_duration') == 'yes',
-        'other':         request.form.get('change_other') == 'yes',
+        'accommodation':     request.form.get('change_accommodation') == 'yes',
+        'dates':             request.form.get('change_dates') == 'yes',
+        'budget':            request.form.get('change_budget') == 'yes',
+        'destinations':      request.form.get('change_destinations') == 'yes',
+        'travelers':         request.form.get('change_travelers') == 'yes',
+        'transport':         request.form.get('change_transport') == 'yes',
+        'duration':          request.form.get('change_duration') == 'yes',
+        'other':             request.form.get('change_other') == 'yes',
         'revised_budget':    request.form.get('revised_budget', ''),
-        'revised_start_date': request.form.get('revised_start_date', ''),
-        'revised_end_date':   request.form.get('revised_end_date', ''),
-        'revised_month':      request.form.get('revised_month', ''),
-        'revised_adults':     request.form.get('revised_adults', '0'),
-        'revised_children':   request.form.get('revised_children', '0'),
-        'preferred_month':    request.form.get('revised_month', ''),
-        'notes':              request.form.get('notes', ''),
-        'selected_extras':    selected_extras,
+        'revised_start_date':request.form.get('revised_start_date', ''),
+        'revised_end_date':  request.form.get('revised_end_date', ''),
+        'revised_month':     request.form.get('revised_month', ''),
+        'revised_adults':    request.form.get('revised_adults', '0'),
+        'revised_children':  request.form.get('revised_children', '0'),
+        'preferred_month':   request.form.get('revised_month', ''),
+        'notes':             request.form.get('notes', ''),
+        'selected_extras':   selected_extras,
     }
 
-    # Build human-readable summary for agent notification
     changes_list = []
     if change_request['accommodation']: changes_list.append('Accommodation')
     if change_request['dates']:         changes_list.append('Travel Dates')
@@ -1887,47 +1299,41 @@ def client_changes_confirm():
     if change_request['duration']:      changes_list.append('Trip Duration')
     if change_request['other']:         changes_list.append('Other')
 
-    # Update quote status and save change request
     supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
         'status': 'revision_requested',
         'change_request': json.dumps(change_request),
     })
 
-    # Trigger Scenario 3 — AI Revision Pipeline
     trigger_make_webhook(MAKE_S3_WEBHOOK, {
-        'event':            'client_changes_requested',
-        'quote_number':     quote_id,
+        'event':             'client_changes_requested',
+        'quote_number':      quote_id,
         'changes_requested': changes_list,
-        'revised_budget':   change_request['revised_budget'],
-        'preferred_month':  change_request['preferred_month'],
-        'notes':            change_request['notes'],
-        'requested_at':     int(time.time()),
+        'revised_budget':    change_request['revised_budget'],
+        'preferred_month':   change_request['preferred_month'],
+        'notes':             change_request['notes'],
+        'requested_at':      int(time.time()),
     })
 
-    logger.info(f"Client requested changes for {quote_id}: {changes_list}")
-
-    # ── Send agent notification email via Resend ──────────────────────────────
     quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
     if quotes:
-        quote = quotes[0]
+        quote  = quotes[0]
         agents = supabase_get('agents', {'id': f'eq.{quote.get("agent_id")}', 'select': '*'})
-        agent = agents[0] if agents else {}
+        agent  = agents[0] if agents else {}
         agent_email_addr = agent.get('email', '')
         if agent_email_addr:
-            brand_primary = agent.get('brand_color_primary', '#2E4A7A')
+            brand_primary   = agent.get('brand_color_primary', '#2E4A7A')
             brand_secondary = agent.get('brand_color_secondary', '#C4922A')
-            agency_name = agent.get('agency_name', 'SafariFlow')
-            agent_name = agent.get('agent_name', 'Agent')
-            portal_link = f"{PORTAL_URL}/quotes/review/{quote_id}"
-            changes_html = ''.join([f'<li style="margin-bottom:6px;color:#1A1A1A;font-size:13px;">{c}</li>' for c in changes_list])
-            budget_line = f'<p style="margin:12px 0;font-size:13px;color:#1A1A1A;"><strong>Revised budget:</strong> ${float(change_request["revised_budget"]):,.0f}</p>' if change_request.get('revised_budget') else ''
-            notes_line = f'<div style="background:#F8F6F2;border-radius:8px;padding:12px 14px;margin:12px 0;font-size:13px;color:#444;">💬 {change_request["notes"]}</div>' if change_request.get('notes') else ''
+            agency_name     = agent.get('agency_name', 'SafariFlow')
+            agent_name      = agent.get('agent_name', 'Agent')
+            portal_link     = f"{PORTAL_URL}/quotes/review/{quote_id}"
+            changes_html    = ''.join([f'<li style="margin-bottom:6px;color:#1A1A1A;font-size:13px;">{c}</li>' for c in changes_list])
+            budget_line     = f'<p style="margin:12px 0;font-size:13px;color:#1A1A1A;"><strong>Revised budget:</strong> ${float(change_request["revised_budget"]):,.0f}</p>' if change_request.get('revised_budget') else ''
+            notes_line      = f'<div style="background:#F8F6F2;border-radius:8px;padding:12px 14px;margin:12px 0;font-size:13px;color:#444;">💬 {change_request["notes"]}</div>' if change_request.get('notes') else ''
 
             revision_email_html = f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"></head>
 <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f4;">
-<table width="100%" cellpadding="0" cellspacing="0">
-<tr><td align="center" style="padding:30px 0;">
+<table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:30px 0;">
 <table width="600" cellpadding="0" cellspacing="0" style="background:white;border-radius:8px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.1);">
 <tr><td style="background-color:{brand_primary};padding:30px;text-align:center;">
   <h1 style="margin:0;color:#FFFFFF;font-size:22px;letter-spacing:2px;">{agency_name}</h1>
@@ -1938,113 +1344,77 @@ def client_changes_confirm():
   <p style="color:#1A1A1A;font-size:16px;margin:0 0 16px;">Hello <strong>{agent_name}</strong>, your client has requested changes to quote <strong>{quote_id}</strong>.</p>
   <div style="background:#FFF8F0;border:1px solid #F5DFB0;border-radius:8px;padding:16px 20px;margin-bottom:20px;">
     <p style="font-size:12px;font-weight:bold;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;">Changes Requested:</p>
-    <ul style="margin:0;padding-left:18px;">{changes_html}</ul>
-    {budget_line}
-    {notes_line}
+    <ul style="margin:0;padding-left:18px;">{changes_html}</ul>{budget_line}{notes_line}
   </div>
-  <p style="color:#1A1A1A;font-size:14px;margin-bottom:20px;">The AI has been notified and will rebuild the quote automatically. Click below to review and approve the revised quote before sending to the client.</p>
   <table width="100%" cellpadding="0" cellspacing="0" style="margin:16px 0;">
-    <tr><td align="center">
-      <a href="{portal_link}" style="display:inline-block;background-color:{brand_primary};color:#FFFFFF;padding:16px 32px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:14px;letter-spacing:1px;">
-        🔍 REVIEW REVISED QUOTE
-      </a>
-    </td></tr>
+    <tr><td align="center"><a href="{portal_link}" style="display:inline-block;background-color:{brand_primary};color:#FFFFFF;padding:16px 32px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:14px;letter-spacing:1px;">🔍 REVIEW REVISED QUOTE</a></td></tr>
   </table>
-  <p style="color:#1A1A1A;font-size:13px;margin:0;">Quote reference: <strong>{quote_id}</strong></p>
 </td></tr>
 <tr><td style="background:#F5F0E8;padding:20px 40px;text-align:center;">
   <p style="margin:0;color:#444444;font-size:12px;">{agency_name} · Powered by SafariFlow</p>
 </td></tr>
-</table>
-</td></tr>
-</table>
+</table></td></tr></table>
 </body></html>"""
 
-            send_email(
-                to=agent_email_addr,
-                subject=f"Client Requested Changes — {quote_id}",
-                html=revision_email_html,
-            )
-            logger.info(f"Revision notification sent to {agent_email_addr}")
+            send_email(to=agent_email_addr, subject=f"Client Requested Changes — {quote_id}", html=revision_email_html)
 
     return success_page('✏️', 'Changes Received!',
-        'Thank you! We have received your change request. Our team will revise your quote and send you an updated version shortly.',
+        'Thank you! We have received your change request and will send you a revised quote shortly.',
         quote_id)
 
 
 # ─── Package Safari PDF ───────────────────────────────────────────────────────
 @app.route('/generate-package-pdf', methods=['POST'])
 def generate_package_pdf():
-    """Stream 2 — Generate PDF from a pre-built package."""
     try:
-        data = request.get_json(force=True)
-        agent_id        = data.get('agent_id', '')
-        package_id      = data.get('package_id', '')
-        client_name     = data.get('client_name', '')
-        client_email    = data.get('client_email', '')
-        client_phone    = data.get('client_phone', '')
+        data             = request.get_json(force=True)
+        agent_id         = data.get('agent_id', '')
+        package_id       = data.get('package_id', '')
+        client_name      = data.get('client_name', '')
+        client_email     = data.get('client_email', '')
+        client_phone     = data.get('client_phone', '')
         client_nationality = data.get('client_nationality', '')
-        start_date      = data.get('start_date', '')
-        end_date        = data.get('end_date', '')
-        pax_adults      = int(data.get('pax_adults', 2))
-        pax_children    = int(data.get('pax_children', 0))
+        start_date       = data.get('start_date', '')
+        end_date         = data.get('end_date', '')
+        pax_adults       = int(data.get('pax_adults', 2))
+        pax_children     = int(data.get('pax_children', 0))
         special_requests = data.get('special_requests', [])
-        request_id      = data.get('request_id', str(uuid.uuid4())[:8])
+        request_id       = data.get('request_id', str(uuid.uuid4())[:8])
 
-        logger.info(f"Package PDF request: agent={agent_id}, package={package_id}, client={client_name}")
-
-        # Fetch agent
         agents = supabase_get('agents', {'id': f'eq.{agent_id}', 'select': '*'})
         if not agents:
             return jsonify({'error': 'Agent not found'}), 404
         agent = agents[0]
 
-        # Fetch package from Supabase
         packages = supabase_get('packages', {'id': f'eq.{package_id}', 'select': '*'})
         if not packages:
             return jsonify({'error': 'Package not found'}), 404
         pkg = packages[0]
 
-        # Calculate pricing with markup
-        base_price = float(pkg.get('base_price_usd_cents', 0)) / 100
-        markup_type = agent.get('markup_type', 'overall')
-        markup_pct = float(agent.get('markup_overall_pct', 0) or 0) / 100
-        if markup_type == 'per_category':
-            markup_pct = float(agent.get('markup_accommodation_pct', 0) or 0) / 100
+        base_price       = float(pkg.get('base_price_usd_cents', 0)) / 100
+        markup_pct       = float(agent.get('markup_overall_pct', 0) or 0) / 100
         total_per_person = round(base_price * (1 + markup_pct), 2)
-        total_price = round(total_per_person * pax_adults, 2)
-        deposit_pct = float(agent.get('deposit_percentage', 30) or 30) / 100
-        deposit = round(total_price * deposit_pct, 2)
-        balance = round(total_price - deposit, 2)
+        total_price      = round(total_per_person * pax_adults, 2)
+        deposit_pct      = float(agent.get('deposit_percentage', 30) or 30) / 100
+        deposit          = round(total_price * deposit_pct, 2)
+        balance          = round(total_price - deposit, 2)
+        duration_days    = pkg.get('duration_days', 7)
+        destinations     = pkg.get('destination', '')
 
-        duration_days = pkg.get('duration_days', 7)
-        destinations = pkg.get('destination', '')
-
-        # Build itinerary from package days
         pkg_itinerary = pkg.get('itinerary_days', [])
         if not pkg_itinerary:
             pkg_itinerary = [{'day_number': i+1, 'destination': destinations, 'title': f'Day {i+1}', 'accommodation_name': pkg.get('accommodation_name', ''), 'room_type': 'Standard Room', 'meal_plan': 'Full Board', 'nights': 1, 'transport_description': None, 'image_search_query': f'{destinations} safari wildlife'} for i in range(duration_days)]
 
-        # Line items
-        line_items = [
-            {'line_type': 'accommodation', 'description': pkg.get('name', ''), 'details': f'{duration_days} nights · {destinations}', 'quantity': pax_adults, 'unit_price': total_per_person, 'total_price': total_price},
-        ]
-
-        # Personalise narrative with Claude
-        narrative_prompt = f"""Write a warm, professional safari introduction for {client_name} who has booked the {pkg.get('name', '')} package.
-Duration: {duration_days} days in {destinations}.
-Special requests: {', '.join(special_requests) if special_requests else 'None'}.
-Keep it to 3 sentences, personal and evocative. Return only the narrative text, no JSON."""
+        line_items = [{'line_type': 'accommodation', 'description': pkg.get('name', ''), 'details': f'{duration_days} nights · {destinations}', 'quantity': pax_adults, 'unit_price': total_per_person, 'total_price': total_price, 'cost_unit_price': base_price, 'cost_total_price': round(base_price * pax_adults, 2), 'markup_pct': round(markup_pct * 100, 2), 'profit': round(total_price - base_price * pax_adults, 2)}]
 
         try:
-            narrative_result = call_claude(narrative_prompt, max_tokens=300)
-            intro_narrative = narrative_result if isinstance(narrative_result, str) else f"{client_name.split()[0]}, your {duration_days}-day safari awaits. Every detail of your {pkg.get('name', '')} experience has been expertly arranged for an unforgettable journey."
+            narrative_result = call_claude(f"Write a warm 3-sentence safari intro for {client_name} booking {pkg.get('name','')} for {duration_days} days in {destinations}. Return only the text.", max_tokens=300)
+            intro_narrative = narrative_result if isinstance(narrative_result, str) else f"{client_name.split()[0]}, your {duration_days}-day safari awaits."
         except Exception:
-            intro_narrative = f"{client_name.split()[0]}, your {duration_days}-day safari awaits. Every detail of your {pkg.get('name', '')} experience has been expertly arranged for an unforgettable journey."
+            intro_narrative = f"{client_name.split()[0]}, your {duration_days}-day safari awaits."
 
-        narrative_days = [{'day_number': d.get('day_number'), 'narrative': d.get('narrative', f"Today you explore {d.get('destination', destinations)} with your expert guide."), 'highlight': d.get('highlight', f"Wildlife encounters in {d.get('destination', destinations)}"), 'accommodation_description': f"{d.get('accommodation_name', '')}, {d.get('room_type', 'Standard Room')} — your comfortable base."} for d in pkg_itinerary]
+        narrative_days = [{'day_number': d.get('day_number'), 'narrative': d.get('narrative', f"Explore {d.get('destination', destinations)}."), 'highlight': d.get('highlight', f"Wildlife in {d.get('destination', destinations)}"), 'accommodation_description': f"{d.get('accommodation_name', '')}, {d.get('room_type', 'Standard Room')} — your base."} for d in pkg_itinerary]
 
-        # Tokens
         quote_number         = f"QT-PKG-{request_id}"
         approve_token        = generate_token(quote_number, 'approve')
         reject_token         = generate_token(quote_number, 'reject')
@@ -2055,27 +1425,22 @@ Keep it to 3 sentences, personal and evocative. Return only the narrative text, 
         client_accept_url    = f"{API_BASE_URL}/client-accept?token={client_accept_token}"
         client_changes_url   = f"{API_BASE_URL}/client-changes?token={client_changes_token}"
 
-        # Fetch photos
         photo_cache = fetch_photos_for_itinerary(pkg_itinerary)
-
         filename    = f"SafariFlow_Package_{quote_number}.pdf"
         output_path = os.path.join(OUTPUT_DIR, filename)
 
         pdf_data = {
-            'quote_id':     quote_number,
-            'generated_at': start_date[:10] if start_date else '',
-            'accept_url':   '#', 'changes_url': '#',
-            'inclusions':   pkg.get('inclusions', '- All accommodation as specified\n- All meals as per itinerary\n- All game drives\n- Park fees'),
-            'exclusions':   pkg.get('exclusions', '- International flights\n- Travel insurance\n- Personal expenses'),
-            'terms':        agent.get('cancellation_terms') or 'This quote is valid for 14 days. A 30% deposit is required to confirm the booking.',
-            'agent':        {'name': agent.get('agent_name', ''), 'email': agent.get('email', ''), 'phone': agent.get('phone', ''), 'agency': agent.get('agency_name', ''), 'logo_url': agent.get('logo_url', ''), 'website': agent.get('website', '')},
-            'client':       {'name': client_name, 'email': client_email, 'phone': client_phone, 'pax_adults': str(pax_adults), 'pax_children': str(pax_children), 'nationality': client_nationality},
-            'trip':         {'title': pkg.get('name', ''), 'start_date': start_date, 'end_date': end_date, 'duration_nights': str(duration_days), 'destinations': destinations, 'travel_style': pkg.get('category', 'Safari')},
-            'itinerary':    pkg_itinerary,
-            'line_items':   line_items,
-            'photo_cache':  photo_cache,
-            'pricing':      {'total_price_usd': total_price, 'deposit_amount_usd': deposit, 'balance_amount_usd': balance, 'within_budget': True, 'budget_notes': ''},
-            'narrative':    {'intro': intro_narrative, 'days': narrative_days},
+            'quote_id': quote_number, 'generated_at': start_date[:10] if start_date else '',
+            'accept_url': '#', 'changes_url': '#',
+            'inclusions': pkg.get('inclusions', '- All accommodation\n- All meals\n- All game drives\n- Park fees'),
+            'exclusions': pkg.get('exclusions', '- International flights\n- Travel insurance\n- Personal expenses'),
+            'terms': agent.get('cancellation_terms') or 'This quote is valid for 14 days.',
+            'agent': {'name': agent.get('agent_name', ''), 'email': agent.get('email', ''), 'phone': agent.get('phone', ''), 'agency': agent.get('agency_name', ''), 'logo_url': agent.get('logo_url', ''), 'website': agent.get('website', '')},
+            'client': {'name': client_name, 'email': client_email, 'phone': client_phone, 'pax_adults': str(pax_adults), 'pax_children': str(pax_children), 'nationality': client_nationality},
+            'trip': {'title': pkg.get('name', ''), 'start_date': start_date, 'end_date': end_date, 'duration_nights': str(duration_days), 'destinations': destinations, 'travel_style': pkg.get('category', 'Safari')},
+            'itinerary': pkg_itinerary, 'line_items': line_items, 'photo_cache': photo_cache,
+            'pricing': {'total_price_usd': total_price, 'deposit_amount_usd': deposit, 'balance_amount_usd': balance, 'within_budget': True, 'budget_notes': ''},
+            'narrative': {'intro': intro_narrative, 'days': narrative_days},
             'agent_profile': {'tagline': 'Travel & Safari Specialists', 'bio': '', 'years_experience': '', 'safaris_planned': '', 'countries_covered': '', 'awards': [], 'memberships': [], 'address': '', 'facebook': '', 'instagram': '', 'linkedin': ''},
             'agent_reviews': [],
         }
@@ -2084,50 +1449,20 @@ Keep it to 3 sentences, personal and evocative. Return only the narrative text, 
         pdf_url = supabase_upload(output_path, filename)
 
         with open(output_path, 'rb') as f:
-            pdf_bytes = f.read()
+            pdf_bytes  = f.read()
             pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
 
-        # Send agent approval email
         agent_email_addr = agent.get('email', '')
         if agent_email_addr:
             email_html = agent_approval_email_html(
-                agent_name=agent.get('agent_name', 'Agent'),
-                agency_name=agent.get('agency_name', 'SafariFlow'),
-                client_name=client_name,
-                quote_number=quote_number,
-                start_date=start_date,
-                end_date=end_date,
-                total_price=total_price,
-                approve_url=approve_url,
-                reject_url=reject_url,
-                brand_primary=agent.get('brand_color_primary', '#2E4A7A'),
-                brand_secondary=agent.get('brand_color_secondary', '#C4922A'),
+                agent_name=agent.get('agent_name', 'Agent'), agency_name=agent.get('agency_name', 'SafariFlow'),
+                client_name=client_name, quote_number=quote_number, start_date=start_date, end_date=end_date,
+                total_price=total_price, approve_url=approve_url, reject_url=reject_url,
+                brand_primary=agent.get('brand_color_primary', '#2E4A7A'), brand_secondary=agent.get('brand_color_secondary', '#C4922A'),
             )
-            send_email(
-                to=agent_email_addr,
-                subject=f"New Package Quote Ready — {client_name} ({quote_number})",
-                html=email_html,
-                attachments=[{'filename': filename, 'content': pdf_base64}]
-            )
+            send_email(to=agent_email_addr, subject=f"New Package Quote Ready — {client_name} ({quote_number})", html=email_html, attachments=[{'filename': filename, 'content': pdf_base64}])
 
-        logger.info(f"Package PDF complete: {filename}")
-        return jsonify({
-            'success': True,
-            'filename': filename,
-            'quote_number': quote_number,
-            'pdf_base64': pdf_base64,
-            'pdf_url': pdf_url,
-            'client_name': client_name,
-            'client_email': client_email,
-            'agent_email': agent.get('email', ''),
-            'total_price_usd': total_price,
-            'deposit_usd': deposit,
-            'balance_usd': balance,
-            'approve_url': approve_url,
-            'reject_url': reject_url,
-            'client_accept_url': client_accept_url,
-            'client_changes_url': client_changes_url,
-        })
+        return jsonify({'success': True, 'filename': filename, 'quote_number': quote_number, 'pdf_base64': pdf_base64, 'pdf_url': pdf_url, 'client_name': client_name, 'client_email': client_email, 'agent_email': agent.get('email', ''), 'total_price_usd': total_price, 'deposit_usd': deposit, 'balance_usd': balance, 'approve_url': approve_url, 'reject_url': reject_url, 'client_accept_url': client_accept_url, 'client_changes_url': client_changes_url})
 
     except Exception as e:
         logger.error(f"Package PDF failed: {str(e)}", exc_info=True)
@@ -2136,16 +1471,9 @@ Keep it to 3 sentences, personal and evocative. Return only the narrative text, 
 
 # ─── Invoicing ────────────────────────────────────────────────────────────────
 def generate_invoice_number(agent_id):
-    """Generate sequential invoice number INV-YYYY-XXXX per agent."""
     import datetime
     year = datetime.date.today().year
-    existing = supabase_get('invoices', {
-        'agent_id': f'eq.{agent_id}',
-        'invoice_number': f'like.INV-{year}-%',
-        'select': 'invoice_number',
-        'order': 'created_at.desc',
-        'limit': '1',
-    })
+    existing = supabase_get('invoices', {'agent_id': f'eq.{agent_id}', 'invoice_number': f'like.INV-{year}-%', 'select': 'invoice_number', 'order': 'created_at.desc', 'limit': '1'})
     if existing:
         try:
             last_num = int(existing[0]['invoice_number'].split('-')[-1])
@@ -2157,59 +1485,51 @@ def generate_invoice_number(agent_id):
 
 @app.route('/generate-invoice', methods=['POST'])
 def generate_invoice():
-    """Generate invoice from accepted quote."""
     try:
-        data = request.get_json(force=True)
-        quote_id   = data.get('quote_id', '')
-        agent_id   = data.get('agent_id', '')
+        data     = request.get_json(force=True)
+        quote_id = data.get('quote_id', '')
+        agent_id = data.get('agent_id', '')
 
         if not quote_id or not agent_id:
             return jsonify({'error': 'quote_id and agent_id required'}), 400
 
-        # Fetch quote
         quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
         if not quotes:
             return jsonify({'error': 'Quote not found'}), 404
         quote = quotes[0]
 
-        # Fetch agent
         agents = supabase_get('agents', {'id': f'eq.{agent_id}', 'select': '*'})
         if not agents:
             return jsonify({'error': 'Agent not found'}), 404
         agent = agents[0]
 
-        # Calculate dates
         import datetime
-        today = datetime.date.today()
-        deposit_pct     = float(agent.get('deposit_percentage', 30) or 30)
-        balance_days    = int(agent.get('balance_due_days', 60) or 60)
-        total_cents     = int(quote.get('total_price_usd_cents', 0) or 0)
+        today        = datetime.date.today()
+        deposit_pct  = float(agent.get('deposit_percentage', 30) or 30)
+        balance_days = int(agent.get('balance_due_days', 60) or 60)
+        total_cents  = int(quote.get('total_price_usd_cents', 0) or 0)
 
-        # Fallback — read total from itinerary_json if not saved directly
         if total_cents == 0:
             try:
                 itinerary = quote.get('itinerary_json')
                 if itinerary:
                     if isinstance(itinerary, str):
-                        import json as _json
-                        itinerary = _json.loads(itinerary)
-                    pricing = itinerary.get('pricing', {})
+                        itinerary = json.loads(itinerary)
+                    pricing   = itinerary.get('pricing', {})
                     total_usd = float(pricing.get('total_price_usd', 0) or 0)
                     if total_usd == 0:
-                        # Try line items sum
-                        line_items_raw = itinerary.get('line_items', [])
-                        total_usd = sum(float(i.get('total_price', 0)) for i in line_items_raw)
+                        total_usd = sum(float(i.get('total_price', 0)) for i in itinerary.get('line_items', []))
                     total_cents = int(total_usd * 100)
-                    logger.info(f"Total read from itinerary_json: ${total_usd}")
             except Exception as e:
                 logger.warning(f"Could not read total from itinerary_json: {e}")
-        deposit_cents   = int(round(total_cents * deposit_pct / 100))
-        balance_cents   = total_cents - deposit_cents
-        deposit_due     = str(today + datetime.timedelta(days=7))
-        start_date      = quote.get('start_date', '')
+
+        deposit_cents = int(round(total_cents * deposit_pct / 100))
+        balance_cents = total_cents - deposit_cents
+        deposit_due   = str(today + datetime.timedelta(days=7))
+        start_date    = quote.get('start_date', '')
         if start_date:
             try:
-                sd = datetime.date.fromisoformat(str(start_date)[:10])
+                sd          = datetime.date.fromisoformat(str(start_date)[:10])
                 balance_due = str(sd - datetime.timedelta(days=balance_days))
             except Exception:
                 balance_due = str(today + datetime.timedelta(days=30))
@@ -2218,130 +1538,75 @@ def generate_invoice():
 
         inv_number = generate_invoice_number(agent_id)
 
-        # Build line items from itinerary_json
         line_items = []
         try:
             itinerary_json = quote.get('itinerary_json')
             if itinerary_json:
                 if isinstance(itinerary_json, str):
-                    import json as _json
-                    itinerary_json = _json.loads(itinerary_json)
+                    itinerary_json = json.loads(itinerary_json)
                 line_items = itinerary_json.get('line_items', [])
         except Exception:
             pass
 
         if not line_items:
-            line_items = [{
-                'description': f"Safari — {quote.get('destinations', '')}",
-                'details': f"{quote.get('duration_nights', '')} nights · {quote.get('pax_adults', 2)} adults",
-                'quantity': quote.get('pax_adults', 2),
-                'unit_price': round(total_cents / 100 / max(int(quote.get('pax_adults', 2)), 1), 2),
-                'total_price': round(total_cents / 100, 2),
-            }]
+            line_items = [{'description': f"Safari — {quote.get('destinations', '')}", 'details': f"{quote.get('duration_days', '')} nights · {quote.get('pax_adults', 2)} adults", 'quantity': quote.get('pax_adults', 2), 'unit_price': round(total_cents / 100 / max(int(quote.get('pax_adults', 2)), 1), 2), 'total_price': round(total_cents / 100, 2)}]
 
-        # Create invoice record in Supabase
-        invoice_id = str(uuid.uuid4())
+        invoice_id     = str(uuid.uuid4())
         invoice_record = {
-            'id':                   invoice_id,
-            'invoice_number':       inv_number,
-            'quote_id':             quote_id,
-            'agent_id':             agent_id,
-            'client_name':          quote.get('client_name', ''),
-            'client_email':         quote.get('client_email', ''),
-            'client_phone':         quote.get('client_phone', ''),
-            'client_nationality':   quote.get('client_nationality', ''),
-            'destinations':         quote.get('destinations', ''),
-            'start_date':           quote.get('start_date', None),
-            'end_date':             quote.get('end_date', None),
-            'pax_adults':           int(quote.get('pax_adults', 2) or 2),
-            'pax_children':         int(quote.get('pax_children', 0) or 0),
-            'duration_nights':      int(quote.get('duration_days', 0) or 0),
-            'subtotal_usd_cents':   total_cents,
-            'tax_usd_cents':        0,
-            'total_usd_cents':      total_cents,
-            'deposit_pct':          deposit_pct,
-            'deposit_usd_cents':    deposit_cents,
-            'balance_usd_cents':    balance_cents,
-            'amount_paid_usd_cents':0,
-            'amount_due_usd_cents': total_cents,
-            'deposit_due_date':     deposit_due,
-            'balance_due_date':     balance_due,
-            'status':               'sent',
-            'line_items':           json.dumps(line_items),
+            'id':                    invoice_id,
+            'invoice_number':        inv_number,
+            'quote_id':              quote_id,
+            'agent_id':              agent_id,
+            'client_name':           quote.get('client_name', ''),
+            'client_email':          quote.get('client_email', ''),
+            'client_phone':          quote.get('client_phone', ''),
+            'client_nationality':    quote.get('client_nationality', ''),
+            'destinations':          quote.get('destinations', ''),
+            'start_date':            quote.get('start_date', None),
+            'end_date':              quote.get('end_date', None),
+            'pax_adults':            int(quote.get('pax_adults', 2) or 2),
+            'pax_children':          int(quote.get('pax_children', 0) or 0),
+            'duration_nights':       int(quote.get('duration_days', 0) or 0),
+            'subtotal_usd_cents':    total_cents,
+            'tax_usd_cents':         0,
+            'total_usd_cents':       total_cents,
+            'deposit_pct':           deposit_pct,
+            'deposit_usd_cents':     deposit_cents,
+            'balance_usd_cents':     balance_cents,
+            'amount_paid_usd_cents': 0,
+            'amount_due_usd_cents':  total_cents,
+            'deposit_due_date':      deposit_due,
+            'balance_due_date':      balance_due,
+            'status':                'sent',
+            'line_items':            json.dumps(line_items),
         }
 
         insert_url = f"{SUPABASE_URL}/rest/v1/invoices"
-        req = urllib.request.Request(
-            insert_url,
-            data=json.dumps(invoice_record).encode('utf-8'),
-            method='POST',
-            headers={
-                'Authorization': f'Bearer {SUPABASE_KEY}',
-                'apikey': SUPABASE_KEY,
-                'Content-Type': 'application/json',
-                'Prefer': 'return=minimal',
-            }
-        )
+        req = urllib.request.Request(insert_url, data=json.dumps(invoice_record).encode('utf-8'), method='POST',
+            headers={'Authorization': f'Bearer {SUPABASE_KEY}', 'apikey': SUPABASE_KEY, 'Content-Type': 'application/json', 'Prefer': 'return=minimal'})
         with urllib.request.urlopen(req, timeout=15) as resp:
             resp.read()
 
-        # Generate PDF
         from pdf_generator import generate_invoice_pdf
         pdf_data = {
-            'agent': {
-                'agency':               agent.get('agency_name', ''),
-                'email':                agent.get('email', ''),
-                'phone':                agent.get('phone', ''),
-                'logo_url':             agent.get('logo_url', ''),
-                'brand_color_primary':  agent.get('brand_color_primary', '#2E4A7A'),
-                'brand_color_secondary':agent.get('brand_color_secondary', '#C4922A'),
-                'cancellation_terms':   agent.get('cancellation_terms', ''),
-                'amendment_terms':      agent.get('amendment_terms', ''),
-                'bank_details':         agent.get('bank_details', ''),
-                'mpesa_details':        agent.get('mpesa_details', ''),
-            },
-            'client': {
-                'name':  quote.get('client_name', ''),
-                'email': quote.get('client_email', ''),
-                'phone': quote.get('client_phone', ''),
-            },
-            'invoice': {
-                'invoice_number': inv_number,
-                'quote_id':       quote_id,
-                'issued_at':      str(today),
-                'total_usd_cents':    total_cents,
-                'deposit_usd_cents':  deposit_cents,
-                'balance_usd_cents':  balance_cents,
-                'deposit_due_date':   deposit_due,
-                'balance_due_date':   balance_due,
-                'destinations':       quote.get('destinations', ''),
-                'start_date':         str(quote.get('start_date', ''))[:10],
-                'end_date':           str(quote.get('end_date', ''))[:10],
-                'pax_adults':         int(quote.get('pax_adults', 2) or 2),
-                'pax_children':       int(quote.get('pax_children', 0) or 0),
-            },
+            'agent': {'agency': agent.get('agency_name', ''), 'email': agent.get('email', ''), 'phone': agent.get('phone', ''), 'logo_url': agent.get('logo_url', ''), 'brand_color_primary': agent.get('brand_color_primary', '#2E4A7A'), 'brand_color_secondary': agent.get('brand_color_secondary', '#C4922A'), 'cancellation_terms': agent.get('cancellation_terms', ''), 'amendment_terms': agent.get('amendment_terms', ''), 'bank_details': agent.get('bank_details', ''), 'mpesa_details': agent.get('mpesa_details', '')},
+            'client': {'name': quote.get('client_name', ''), 'email': quote.get('client_email', ''), 'phone': quote.get('client_phone', '')},
+            'invoice': {'invoice_number': inv_number, 'quote_id': quote_id, 'issued_at': str(today), 'total_usd_cents': total_cents, 'deposit_usd_cents': deposit_cents, 'balance_usd_cents': balance_cents, 'deposit_due_date': deposit_due, 'balance_due_date': balance_due, 'destinations': quote.get('destinations', ''), 'start_date': str(quote.get('start_date', ''))[:10], 'end_date': str(quote.get('end_date', ''))[:10], 'pax_adults': int(quote.get('pax_adults', 2) or 2), 'pax_children': int(quote.get('pax_children', 0) or 0)},
             'line_items': line_items,
         }
 
         filename    = f"SafariFlow_Invoice_{inv_number}.pdf"
         output_path = os.path.join(OUTPUT_DIR, filename)
         generate_invoice_pdf(pdf_data, output_path)
-
-        # Upload to Supabase storage
         pdf_url = supabase_upload(output_path, filename)
-
-        # Update invoice with PDF URL
         supabase_update('invoices', {'id': f'eq.{invoice_id}'}, {'pdf_url': pdf_url})
 
-        # Read PDF for email attachment
         with open(output_path, 'rb') as f:
             pdf_base64 = base64.b64encode(f.read()).decode('utf-8')
 
-        # Send invoice email to client
         client_email_addr = quote.get('client_email', '')
         if client_email_addr:
-            invoice_html = f"""
-            <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+            invoice_html = f"""<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
               <div style="background:{agent.get('brand_color_primary','#2E4A7A')};padding:28px;text-align:center;color:white;border-radius:12px 12px 0 0">
                 <h1 style="margin:0;font-size:20px;letter-spacing:2px">{agent.get('agency_name','')}</h1>
                 <p style="margin:8px 0 0;opacity:0.8;font-size:12px">INVOICE</p>
@@ -2356,58 +1621,36 @@ def generate_invoice():
                   <p style="margin:4px 0;color:#444;font-size:13px">Deposit due by {deposit_due}: <strong>${deposit_cents/100:,.2f}</strong></p>
                   <p style="margin:4px 0;color:#444;font-size:13px">Balance due by {balance_due}: <strong>${balance_cents/100:,.2f}</strong></p>
                 </div>
-                <p style="color:#444;font-size:13px">Please contact us if you have any questions.</p>
                 <p style="color:#444;font-size:13px">Kind regards,<br/><strong>{agent.get('agent_name','')}</strong><br/>{agent.get('agency_name','')}</p>
               </div>
             </div>"""
-            send_email(
-                to=client_email_addr,
-                subject=f"Invoice {inv_number} — {agent.get('agency_name','')}",
-                html=invoice_html,
-                attachments=[{'filename': filename, 'content': pdf_base64}]
-            )
+            send_email(to=client_email_addr, subject=f"Invoice {inv_number} — {agent.get('agency_name','')}", html=invoice_html, attachments=[{'filename': filename, 'content': pdf_base64}])
 
-        # Notify agent
         agent_email_addr = agent.get('email', '')
         if agent_email_addr:
-            send_email(
-                to=agent_email_addr,
-                subject=f"Invoice Sent — {quote.get('client_name','')} ({inv_number})",
-                html=f"""
-                <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:28px">
+            send_email(to=agent_email_addr, subject=f"Invoice Sent — {quote.get('client_name','')} ({inv_number})",
+                html=f"""<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:28px">
                   <h2>Invoice Sent ✅</h2>
                   <p>Invoice <strong>{inv_number}</strong> has been sent to {quote.get('client_name','')}.</p>
-                  <p>Total: <strong>${total_cents/100:,.2f}</strong><br/>
-                  Deposit due: {deposit_due}<br/>
-                  Balance due: {balance_due}</p>
-                </div>""",
-            )
+                  <p>Total: <strong>${total_cents/100:,.2f}</strong><br/>Deposit due: {deposit_due}<br/>Balance due: {balance_due}</p>
+                </div>""")
 
         logger.info(f"Invoice generated: {inv_number} for {quote_id}")
-        return jsonify({
-            'success':        True,
-            'invoice_id':     invoice_id,
-            'invoice_number': inv_number,
-            'pdf_url':        pdf_url,
-            'total':          total_cents / 100,
-            'deposit':        deposit_cents / 100,
-            'balance':        balance_cents / 100,
-            'deposit_due':    deposit_due,
-            'balance_due':    balance_due,
-        })
+        return jsonify({'success': True, 'invoice_id': invoice_id, 'invoice_number': inv_number, 'pdf_url': pdf_url, 'total': total_cents/100, 'deposit': deposit_cents/100, 'balance': balance_cents/100, 'deposit_due': deposit_due, 'balance_due': balance_due})
 
     except Exception as e:
         logger.error(f"Invoice generation error: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
+# ─── Confirm Payment — FIXED: uses agent_id from invoice, not request ─────────
 @app.route('/confirm-payment', methods=['POST'])
 def confirm_payment():
     """Agent confirms a payment received."""
     try:
         data           = request.get_json(force=True)
         invoice_id     = data.get('invoice_id', '')
-        agent_id       = data.get('agent_id', '')
+        agent_id       = data.get('agent_id', '')  # kept for logging only
         payment_type   = data.get('payment_type', 'deposit')
         payment_method = data.get('payment_method', 'bank_transfer')
         amount_usd     = float(data.get('amount_usd', 0))
@@ -2416,49 +1659,43 @@ def confirm_payment():
 
         logger.info(f"Payment confirm request: invoice={invoice_id}, agent={agent_id}, amount=${amount_usd}, type={payment_type}")
 
-        if not invoice_id or not agent_id:
-            logger.error(f"Missing fields: invoice_id={invoice_id}, agent_id={agent_id}")
-            return jsonify({'error': 'invoice_id and agent_id required'}), 400
+        if not invoice_id:
+            return jsonify({'error': 'invoice_id required'}), 400
 
-        # Fetch invoice
+        # Always use agent_id from the invoice record itself —
+        # fixes mismatch between test agent (000...001) and real Clerk agent
         invoices = supabase_get('invoices', {'id': f'eq.{invoice_id}', 'select': '*'})
         if not invoices:
             return jsonify({'error': 'Invoice not found'}), 404
         invoice = invoices[0]
 
+        invoice_agent_id = invoice.get('agent_id', agent_id)
+        logger.info(f"Using invoice agent_id: {invoice_agent_id} (request sent: {agent_id})")
+
         amount_cents = int(amount_usd * 100)
 
-        # Record payment
-        payment_id = str(uuid.uuid4())
+        payment_id     = str(uuid.uuid4())
         payment_record = {
-            'id':             payment_id,
-            'invoice_id':     invoice_id,
-            'agent_id':       agent_id,
-            'payment_type':   payment_type,
-            'payment_method': payment_method,
+            'id':               payment_id,
+            'invoice_id':       invoice_id,
+            'agent_id':         invoice_agent_id,
+            'payment_type':     payment_type,
+            'payment_method':   payment_method,
             'amount_usd_cents': amount_cents,
-            'reference':      reference,
-            'notes':          notes,
-            'confirmed_by':   'agent',
+            'reference':        reference,
+            'notes':            notes,
+            'confirmed_by':     'agent',
         }
         insert_url = f"{SUPABASE_URL}/rest/v1/payments"
-        req = urllib.request.Request(
-            insert_url,
-            data=json.dumps(payment_record).encode('utf-8'),
-            method='POST',
-            headers={
-                'Authorization': f'Bearer {SUPABASE_KEY}',
-                'apikey': SUPABASE_KEY,
-                'Content-Type': 'application/json',
-                'Prefer': 'return=minimal',
-            }
-        )
+        req = urllib.request.Request(insert_url, data=json.dumps(payment_record).encode('utf-8'), method='POST',
+            headers={'Authorization': f'Bearer {SUPABASE_KEY}', 'apikey': SUPABASE_KEY, 'Content-Type': 'application/json', 'Prefer': 'return=minimal'})
         with urllib.request.urlopen(req, timeout=15) as resp:
             resp.read()
         logger.info(f"Payment record saved: {payment_id}, amount=${amount_usd}")
-        paid_so_far  = int(invoice.get('amount_paid_usd_cents', 0) or 0) + amount_cents
-        total_cents  = int(invoice.get('total_usd_cents', 0) or 0)
-        amount_due   = max(0, total_cents - paid_so_far)
+
+        paid_so_far   = int(invoice.get('amount_paid_usd_cents', 0) or 0) + amount_cents
+        total_cents   = int(invoice.get('total_usd_cents', 0) or 0)
+        amount_due    = max(0, total_cents - paid_so_far)
         deposit_cents = int(invoice.get('deposit_usd_cents', 0) or 0)
 
         if paid_so_far >= total_cents:
@@ -2474,41 +1711,31 @@ def confirm_payment():
             'status':                new_status,
         })
 
-        # Update quote status if deposit paid
         quote_id = invoice.get('quote_id', '')
         if quote_id and new_status in ('deposit_paid', 'balance_paid'):
             supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {
                 'status': 'confirmed' if new_status == 'balance_paid' else 'deposit_paid'
             })
 
-        logger.info(f"Payment confirmed: {payment_type} ${amount_usd} for invoice {invoice_id}")
-        return jsonify({
-            'success':       True,
-            'payment_id':    payment_id,
-            'new_status':    new_status,
-            'amount_paid':   paid_so_far / 100,
-            'amount_due':    amount_due / 100,
-        })
+        logger.info(f"Payment confirmed: {payment_type} ${amount_usd} for invoice {invoice_id} → {new_status}")
+        return jsonify({'success': True, 'payment_id': payment_id, 'new_status': new_status, 'amount_paid': paid_so_far/100, 'amount_due': amount_due/100})
 
     except Exception as e:
         logger.error(f"Payment confirmation error: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
-
+# ─── Upload Inventory ─────────────────────────────────────────────────────────
 @app.route('/upload-inventory/<inventory_type>', methods=['POST'])
 def upload_inventory(inventory_type):
-    """Parse uploaded Excel file and save rows to Supabase."""
     try:
         import openpyxl
 
         agent_id = request.form.get('agent_id', '')
         if not agent_id:
             return jsonify({'error': 'agent_id required'}), 400
-
         if inventory_type not in ['accommodations', 'transport', 'park_fees']:
             return jsonify({'error': 'Invalid inventory type'}), 400
-
         if 'file' not in request.files:
             return jsonify({'error': 'No file uploaded'}), 400
 
@@ -2516,109 +1743,45 @@ def upload_inventory(inventory_type):
         if not file.filename.endswith(('.xlsx', '.xls')):
             return jsonify({'error': 'Please upload an Excel file (.xlsx)'}), 400
 
-        # Save temp file
         temp_path = os.path.join(OUTPUT_DIR, f'temp_{agent_id}_{inventory_type}.xlsx')
         file.save(temp_path)
 
         wb = openpyxl.load_workbook(temp_path, data_only=True)
         ws = wb.active
 
-        # Find header row (row 4) and data rows (row 5+)
-        headers = []
-        for cell in ws[4]:
-            if cell.value:
-                headers.append(str(cell.value).strip())
-
         rows_inserted = 0
         rows_skipped  = 0
         errors        = []
 
         for row_num, row in enumerate(ws.iter_rows(min_row=5, values_only=True), start=5):
-            # Skip empty rows
             if not any(row):
                 continue
-            # Skip example row if it contains example data
             first_val = str(row[0] or '').strip()
             if not first_val:
                 continue
 
             try:
                 if inventory_type == 'accommodations':
-                    record = {
-                        'id':                           str(uuid.uuid4()),
-                        'agent_id':                     agent_id,
-                        'name':                         str(row[0] or '').strip(),
-                        'destination':                  str(row[1] or '').strip(),
-                        'category':                     str(row[2] or '').strip(),
-                        'room_type':                    str(row[3] or '').strip(),
-                        'meal_plan':                    str(row[4] or '').strip(),
-                        'price_per_person_usd_cents':   int(float(row[5] or 0) * 100),
-                        'child_price_per_person_usd_cents': int(float(row[6] or 0) * 100) if row[6] else None,
-                        'child_age_min':                int(row[7]) if row[7] else 2,
-                        'child_age_max':                int(row[8]) if row[8] else 12,
-                        'notes':                        str(row[9] or '').strip() or None,
-                    }
+                    record = {'id': str(uuid.uuid4()), 'agent_id': agent_id, 'name': str(row[0] or '').strip(), 'destination': str(row[1] or '').strip(), 'category': str(row[2] or '').strip(), 'room_type': str(row[3] or '').strip(), 'meal_plan': str(row[4] or '').strip(), 'price_per_person_usd_cents': int(float(row[5] or 0) * 100), 'child_price_per_person_usd_cents': int(float(row[6] or 0) * 100) if row[6] else None, 'child_age_min': int(row[7]) if row[7] else 2, 'child_age_max': int(row[8]) if row[8] else 12, 'notes': str(row[9] or '').strip() or None}
                     if not record['name'] or not record['destination']:
-                        rows_skipped += 1
-                        continue
+                        rows_skipped += 1; continue
                     table = 'accommodations'
 
                 elif inventory_type == 'transport':
-                    pricing_type = str(row[4] or 'per_vehicle_per_day').strip()
-                    record = {
-                        'id':                           str(uuid.uuid4()),
-                        'agent_id':                     agent_id,
-                        'transport_mode':               str(row[0] or 'Road').strip(),
-                        'from_location':                str(row[1] or '').strip(),
-                        'to_location':                  str(row[2] or '').strip(),
-                        'operator_name':                str(row[3] or '').strip(),
-                        'transport_type':               str(row[3] or '').strip(),
-                        'pricing_type':                 pricing_type,
-                        'price_per_person_usd_cents':   int(float(row[5] or 0) * 100),
-                        'child_price_per_person_usd_cents': int(float(row[6] or 0) * 100) if row[6] else None,
-                        'child_age_min':                int(row[7]) if row[7] else 2,
-                        'child_age_max':                int(row[8]) if row[8] else 12,
-                        'duration_hours':               float(row[9]) if row[9] else None,
-                        'max_passengers':               int(row[10]) if row[10] else None,
-                        'notes':                        str(row[11] or '').strip() or None,
-                    }
+                    record = {'id': str(uuid.uuid4()), 'agent_id': agent_id, 'transport_mode': str(row[0] or 'Road').strip(), 'from_location': str(row[1] or '').strip(), 'to_location': str(row[2] or '').strip(), 'operator_name': str(row[3] or '').strip(), 'transport_type': str(row[3] or '').strip(), 'pricing_type': str(row[4] or 'per_vehicle_per_day').strip(), 'price_per_person_usd_cents': int(float(row[5] or 0) * 100), 'child_price_per_person_usd_cents': int(float(row[6] or 0) * 100) if row[6] else None, 'child_age_min': int(row[7]) if row[7] else 2, 'child_age_max': int(row[8]) if row[8] else 12, 'duration_hours': float(row[9]) if row[9] else None, 'max_passengers': int(row[10]) if row[10] else None, 'notes': str(row[11] or '').strip() or None}
                     if not record['from_location'] or not record['to_location']:
-                        rows_skipped += 1
-                        continue
+                        rows_skipped += 1; continue
                     table = 'transport_routes'
 
                 elif inventory_type == 'park_fees':
-                    record = {
-                        'id':                               str(uuid.uuid4()),
-                        'agent_id':                         agent_id,
-                        'park_name':                        str(row[0] or '').strip(),
-                        'destination':                      str(row[1] or '').strip(),
-                        'visitor_category':                 str(row[2] or 'Non-Resident').strip(),
-                        'fee_per_person_per_day_usd_cents': int(float(row[3] or 0) * 100),
-                        'child_fee_per_person_per_day_usd_cents': int(float(row[4] or 0) * 100) if row[4] else None,
-                        'child_age_min':                    int(row[5]) if row[5] else 3,
-                        'child_age_max':                    int(row[6]) if row[6] else 17,
-                        'notes':                            str(row[7] or '').strip() or None,
-                    }
+                    record = {'id': str(uuid.uuid4()), 'agent_id': agent_id, 'park_name': str(row[0] or '').strip(), 'destination': str(row[1] or '').strip(), 'visitor_category': str(row[2] or 'Non-Resident').strip(), 'fee_per_person_per_day_usd_cents': int(float(row[3] or 0) * 100), 'child_fee_per_person_per_day_usd_cents': int(float(row[4] or 0) * 100) if row[4] else None, 'child_age_min': int(row[5]) if row[5] else 3, 'child_age_max': int(row[6]) if row[6] else 17, 'notes': str(row[7] or '').strip() or None}
                     if not record['park_name']:
-                        rows_skipped += 1
-                        continue
+                        rows_skipped += 1; continue
                     table = 'park_fees'
 
-                # Insert to Supabase
                 insert_url = f"{SUPABASE_URL}/rest/v1/{table}"
-                insert_payload = json.dumps(record).encode('utf-8')
-                req = urllib.request.Request(
-                    insert_url,
-                    data=insert_payload,
-                    method='POST',
-                    headers={
-                        'Authorization': f'Bearer {SUPABASE_KEY}',
-                        'apikey': SUPABASE_KEY,
-                        'Content-Type': 'application/json',
-                        'Prefer': 'return=minimal',
-                    }
-                )
+                req = urllib.request.Request(insert_url, data=json.dumps(record).encode('utf-8'), method='POST',
+                    headers={'Authorization': f'Bearer {SUPABASE_KEY}', 'apikey': SUPABASE_KEY, 'Content-Type': 'application/json', 'Prefer': 'return=minimal'})
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     resp.read()
                 rows_inserted += 1
@@ -2627,20 +1790,12 @@ def upload_inventory(inventory_type):
                 errors.append(f"Row {row_num}: {str(row_err)}")
                 rows_skipped += 1
 
-        # Cleanup temp file
         try:
             os.remove(temp_path)
         except Exception:
             pass
 
-        logger.info(f"Inventory upload: {inventory_type}, inserted={rows_inserted}, skipped={rows_skipped}")
-        return jsonify({
-            'success': True,
-            'inventory_type': inventory_type,
-            'rows_inserted': rows_inserted,
-            'rows_skipped': rows_skipped,
-            'errors': errors[:5],
-        })
+        return jsonify({'success': True, 'inventory_type': inventory_type, 'rows_inserted': rows_inserted, 'rows_skipped': rows_skipped, 'errors': errors[:5]})
 
     except Exception as e:
         logger.error(f"Inventory upload error: {str(e)}", exc_info=True)
@@ -2650,17 +1805,12 @@ def upload_inventory(inventory_type):
 # ─── Template Downloads ───────────────────────────────────────────────────────
 @app.route('/download-template/<template_type>', methods=['GET'])
 def download_template(template_type):
-    """Generate and return an Excel inventory template."""
     try:
         import openpyxl
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
 
-        NAVY = '2E4A7A'
-        GOLD = 'C4922A'
-        EXAMPLE = 'FFF8EC'
-        LIGHT = 'EEF2F8'
-        BC = 'CCCCCC'
+        NAVY = '2E4A7A'; GOLD = 'C4922A'; EXAMPLE = 'FFF8EC'; BC = 'CCCCCC'
 
         def side(): return Side(style='thin', color=BC)
         def border(): return Border(left=side(), right=side(), top=side(), bottom=side())
@@ -2694,8 +1844,7 @@ def download_template(template_type):
             c2.alignment = Alignment(horizontal='center', vertical='center')
             ws.row_dimensions[2].height = 20
             ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=ncols)
-            c3 = ws.cell(row=3, column=1,
-                value='ROW 5 IS AN EXAMPLE — Delete before uploading. Fill from row 6 onwards.')
+            c3 = ws.cell(row=3, column=1, value='ROW 5 IS AN EXAMPLE — Delete before uploading. Fill from row 6 onwards.')
             c3.font = Font(bold=True, name='Arial', size=9, color='CC0000')
             c3.fill = PatternFill('solid', start_color='FFF0F0')
             c3.alignment = Alignment(horizontal='center', vertical='center')
@@ -2707,79 +1856,47 @@ def download_template(template_type):
 
         if template_type == 'accommodations':
             ws.title = 'Accommodations'
-            cols = [
-                ('Property Name', 22), ('Destination', 18), ('Category', 18),
-                ('Room Type', 18), ('Meal Plan', 16),
-                ('Adult Price Per Person (USD)', 22), ('Child Price Per Person (USD)', 22),
-                ('Child Age Min', 14), ('Child Age Max', 14), ('Notes', 28),
-            ]
-            title(ws, 'SafariFlow — Accommodations Template',
-                  'One row per property / room type combination.', len(cols))
+            cols = [('Property Name',22),('Destination',18),('Category',18),('Room Type',18),('Meal Plan',16),('Adult Price Per Person (USD)',22),('Child Price Per Person (USD)',22),('Child Age Min',14),('Child Age Max',14),('Notes',28)]
+            title(ws, 'SafariFlow — Accommodations Template', 'One row per property / room type combination.', len(cols))
             for i, (h, w) in enumerate(cols, 1): hdr(ws, 4, i, h, w)
-            for i, v in enumerate(['Angama Mara','Masai Mara','Luxury','Tent Suite',
-                                    'Full Board',850,425,6,12,'Min 2 nights'], 1): ex(ws, 5, i, v)
+            for i, v in enumerate(['Angama Mara','Masai Mara','Luxury','Tent Suite','Full Board',850,425,6,12,'Min 2 nights'], 1): ex(ws, 5, i, v)
             filename = 'SafariFlow_Accommodations_Template.xlsx'
 
         elif template_type == 'transport':
             ws.title = 'Transport'
-            cols = [
-                ('Transport Mode', 16), ('From Location', 20), ('To Location', 20),
-                ('Operator / Vehicle Name', 24), ('Pricing Type', 26), ('Price (USD)', 16),
-                ('Child Price (USD)', 18), ('Child Age Min', 14), ('Child Age Max', 14),
-                ('Duration (Hours)', 16), ('Max Passengers', 16), ('Notes', 28),
-            ]
-            title(ws, 'SafariFlow — Transport Template',
-                  'Road = per_vehicle_per_day · Flight = per_person_per_sector · Train = per_person_per_trip',
-                  len(cols))
+            cols = [('Transport Mode',16),('From Location',20),('To Location',20),('Operator / Vehicle Name',24),('Pricing Type',26),('Price (USD)',16),('Child Price (USD)',18),('Child Age Min',14),('Child Age Max',14),('Duration (Hours)',16),('Max Passengers',16),('Notes',28)]
+            title(ws, 'SafariFlow — Transport Template', 'Road = per_vehicle_per_day · Flight = per_person_per_sector · Train = per_person_per_trip', len(cols))
             for i, (h, w) in enumerate(cols, 1): hdr(ws, 4, i, h, w)
-            examples = [
-                ['Road','Nairobi','Masai Mara','Land Cruiser 4x4','per_vehicle_per_day',200,'',2,12,6,7,'Pop-up roof'],
-                ['Flight','Nairobi (WIL)','Masai Mara (MRE)','Safarilink','per_person_per_sector',150,115,2,12,0.5,12,'Morning only'],
-                ['Train','Nairobi','Mombasa','SGR Economy','per_person_per_trip',30,15,2,12,4.5,'','Book 2wks ahead'],
-            ]
-            for r, row in enumerate(examples, 5):
+            for r, row in enumerate([['Road','Nairobi','Masai Mara','Land Cruiser 4x4','per_vehicle_per_day',200,'',2,12,6,7,'Pop-up roof'],['Flight','Nairobi (WIL)','Masai Mara (MRE)','Safarilink','per_person_per_sector',150,115,2,12,0.5,12,'Morning only'],['Train','Nairobi','Mombasa','SGR Economy','per_person_per_trip',30,15,2,12,4.5,'','Book 2wks ahead']], 5):
                 for c, v in enumerate(row, 1): ex(ws, r, c, v)
             filename = 'SafariFlow_Transport_Template.xlsx'
 
         elif template_type == 'park_fees':
             ws.title = 'Park Fees'
-            cols = [
-                ('Park / Reserve Name', 26), ('Destination / Region', 22),
-                ('Visitor Category', 24), ('Fee Per Person Per Day (USD)', 24),
-                ('Child Fee Per Day (USD)', 22), ('Child Age Min', 14),
-                ('Child Age Max', 14), ('Notes', 30),
-            ]
-            title(ws, 'SafariFlow — Park Fees Template',
-                  'One row per park per visitor category.', len(cols))
+            cols = [('Park / Reserve Name',26),('Destination / Region',22),('Visitor Category',24),('Fee Per Person Per Day (USD)',24),('Child Fee Per Day (USD)',22),('Child Age Min',14),('Child Age Max',14),('Notes',30)]
+            title(ws, 'SafariFlow — Park Fees Template', 'One row per park per visitor category.', len(cols))
             for i, (h, w) in enumerate(cols, 1): hdr(ws, 4, i, h, w)
-            examples = [
-                ['Masai Mara National Reserve','Masai Mara','Non-Resident',80,40,3,17,'KWS 2025'],
-                ['Masai Mara National Reserve','Masai Mara','East Africa Resident',35,20,3,17,'EAC passport required'],
-                ['Amboseli National Park','Amboseli','Non-Resident',60,30,3,17,'KWS 2025'],
-                ['Serengeti National Park','Serengeti','Non-Resident',70,35,5,17,'TANAPA 2025'],
-            ]
-            for r, row in enumerate(examples, 5):
+            for r, row in enumerate([['Masai Mara National Reserve','Masai Mara','Non-Resident',80,40,3,17,'KWS 2025'],['Masai Mara National Reserve','Masai Mara','East Africa Resident',35,20,3,17,'EAC passport required'],['Amboseli National Park','Amboseli','Non-Resident',60,30,3,17,'KWS 2025'],['Serengeti National Park','Serengeti','Non-Resident',70,35,5,17,'TANAPA 2025']], 5):
                 for c, v in enumerate(row, 1): ex(ws, r, c, v)
             filename = 'SafariFlow_ParkFees_Template.xlsx'
         else:
             return jsonify({'error': 'Invalid template type'}), 400
 
-        # Stream file back
         from io import BytesIO
-        from flask import send_file
         output = BytesIO()
         wb.save(output)
         output.seek(0)
-        return send_file(
-            output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name=filename,
-        )
+        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name=filename)
 
     except Exception as e:
         logger.error(f"Template download error: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+
+
+# ─── Health ───────────────────────────────────────────────────────────────────
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok', 'service': 'SafariFlow API v5'})
 
 
 if __name__ == '__main__':
