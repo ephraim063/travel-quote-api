@@ -192,6 +192,7 @@ def trigger_make_webhook(webhook_url, payload):
 # ─── Email helper — Gmail SMTP primary, Resend fallback ──────────────────────
 GMAIL_USER     = os.environ.get('GMAIL_USER', '')
 GMAIL_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD', '')
+logger.info(f"Email config: Gmail={'YES' if GMAIL_USER else 'NO'}, Resend={'YES' if os.environ.get('RESEND_API_KEY') else 'NO'}")
 
 def send_email(to, subject, html, attachments=None):
     """Send email — Gmail SMTP primary, Resend fallback."""
@@ -233,8 +234,6 @@ def send_email(to, subject, html, attachments=None):
 
         except Exception as e:
             logger.error(f"Gmail SMTP error: {str(e)} — trying Resend fallback")
-
-    # ── Resend fallback ───────────────────────────────────────────────────────
     if not RESEND_API_KEY:
         logger.warning("No email provider configured — skipping email")
         return False
