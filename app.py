@@ -190,66 +190,62 @@ def trigger_make_webhook(webhook_url, payload):
 
 
 # ─── Email helper — Gmail SMTP primary, Resend fallback ──────────────────────
+BREVO_API_KEY  = os.environ.get('BREVO_API_KEY', '')
 GMAIL_USER     = os.environ.get('GMAIL_USER', 'ephraim063@gmail.com')
 GMAIL_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD', 'qubkcdmkrkwbzpjx')
-logger.info(f"Email config: Gmail={'YES' if GMAIL_USER else 'NO'}, Resend={'YES' if os.environ.get('RESEND_API_KEY') else 'NO'}")
+logger.info(f"Email config: Brevo={'YES' if BREVO_API_KEY else 'NO'}, Resend={'YES' if os.environ.get('RESEND_API_KEY') else 'NO'}")
 
 def send_email(to, subject, html, attachments=None):
-    """Send email — Gmail SMTP primary, Resend fallback."""
+    """Send email — Brevo API primary, Resend fallback."""
+    to_list = [to] if isinstance(to, str) else to
 
-    # ── Try Gmail SMTP first ──────────────────────────────────────────────────
-    if GMAIL_USER and GMAIL_PASSWORD:
+    # ── Brevo API ─────────────────────────────────────────────────────────────
+    if BREVO_API_KEY:
         try:
-            import smtplib
-            from email.mime.multipart import MIMEMultipart
-            from email.mime.text import MIMEText
-            from email.mime.base import MIMEBase
-            from email import encoders
-
-            msg = MIMEMultipart('mixed')
-            msg['From']    = GMAIL_USER
-            msg['To']      = to if isinstance(to, str) else ', '.join(to)
-            msg['Subject'] = subject
-
-            msg.attach(MIMEText(html, 'html'))
-
-            # Attachments
+            payload = {
+                'sender':      {'name': 'SafariFlow', 'email': 'ephraim063@gmail.com'},
+                'to':          [{'email': t} for t in to_list],
+                'subject':     subject,
+                'htmlContent': html,
+            }
             if attachments:
-                for att in attachments:
-                    part = MIMEBase('application', 'octet-stream')
-                    part.set_payload(base64.b64decode(att['content']))
-                    encoders.encode_base64(part)
-                    part.add_header(
-                        'Content-Disposition',
-                        f'attachment; filename="{att["filename"]}"'
-                    )
-                    msg.attach(part)
-
-            with smtplib.SMTP('smtp.gmail.com', 587) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(GMAIL_USER, GMAIL_PASSWORD)
-                server.sendmail(GMAIL_USER, to if isinstance(to, list) else [to], msg.as_string())
-
-            logger.info(f"Email sent via Gmail SMTP to {to}")
+                payload['attachment'] = [
+                    {'name': att['filename'], 'content': att['content']}
+                    for att in attachments
+                ]
+            data = json.dumps(payload).encode('utf-8')
+            req = urllib.request.Request(
+                'https://api.brevo.com/v3/smtp/email',
+                data=data, method='POST',
+                headers={
+                    'api-key':      BREVO_API_KEY,
+                    'Content-Type': 'application/json',
+                    'Accept':       'application/json',
+                }
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read().decode())
+                logger.info(f"Email sent via Brevo: {result.get('messageId', 'ok')}")
             return True
-
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode()
+            logger.error(f"Brevo error: {e.code} — {error_body}")
         except Exception as e:
-            logger.error(f"Gmail SMTP error: {str(e)} — trying Resend fallback")
+            logger.error(f"Brevo error: {str(e)}")
+
+    # ── Resend fallback ───────────────────────────────────────────────────────
     if not RESEND_API_KEY:
         logger.warning("No email provider configured — skipping email")
         return False
     try:
         payload = {
             'from': RESEND_FROM,
-            'to': [to] if isinstance(to, str) else to,
+            'to': to_list,
             'subject': subject,
             'html': html,
         }
         if attachments:
             payload['attachments'] = attachments
-
         data = json.dumps(payload).encode('utf-8')
         req = urllib.request.Request(
             'https://api.resend.com/emails',
