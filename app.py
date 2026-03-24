@@ -16,19 +16,12 @@ import urllib.error
 import urllib.parse
 import time
 from flask import Flask, request, jsonify, redirect, send_file
-from flask_cors import CORS
 from pdf_generator import generate_quote_pdf
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, origins=[
-    'https://safariflow-portal-git-main-ephraim063s-projects.vercel.app',
-    'https://*.vercel.app',
-    'http://localhost:5173',
-    'http://localhost:3000',
-])
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
 @app.after_request
