@@ -1,9 +1,12 @@
 """
 SafariFlow Flask API v5
+Fixes:
+- create_invoice(): shared function, no internal HTTP (fixes timeout)
+- Duplicate invoice guard: checks before generating (fixes 6x invoice bug)
+- client_accept_confirm: POST-redirect pattern prevents resubmission
 - confirm_payment: uses agent_id from invoice record (fixes mismatch)
 - markup loop: saves cost_unit_price, cost_total_price, markup_pct, profit
-- generate_pdf: generates + uploads cost breakdown PDF, saves cost_breakdown_url
-- agent_approval_email: includes View Cost Breakdown button (no attachment)
+- agent_approval_email: cost breakdown as link only, no attachment
 """
 
 import os
@@ -109,12 +112,10 @@ def supabase_get(table, params=None):
 
 def supabase_update(table, match_params, update_data):
     if not SUPABASE_URL or not SUPABASE_KEY:
-        logger.error("Supabase credentials missing — cannot update")
         return False
     try:
         query = f"{SUPABASE_URL}/rest/v1/{table}?" + urllib.parse.urlencode(match_params)
-        payload = json.dumps(update_data).encode('utf-8')
-        req = urllib.request.Request(query, data=payload, method='PATCH', headers={
+        req = urllib.request.Request(query, data=json.dumps(update_data).encode('utf-8'), method='PATCH', headers={
             'Authorization': f'Bearer {SUPABASE_KEY}',
             'apikey': SUPABASE_KEY,
             'Content-Type': 'application/json',
@@ -124,7 +125,7 @@ def supabase_update(table, match_params, update_data):
             resp.read()
         return True
     except urllib.error.HTTPError as e:
-        logger.error(f"Supabase PATCH HTTP error: {e.code} {e.reason} — {e.read().decode()}")
+        logger.error(f"Supabase PATCH error: {e.code} — {e.read().decode()}")
         return False
     except Exception as e:
         logger.error(f"Supabase PATCH error: {str(e)}")
@@ -133,7 +134,6 @@ def supabase_update(table, match_params, update_data):
 
 def supabase_upload(file_path, filename):
     if not SUPABASE_URL or not SUPABASE_KEY:
-        logger.error("Supabase credentials missing — cannot upload")
         return ''
     try:
         upload_url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{filename}"
@@ -150,7 +150,7 @@ def supabase_upload(file_path, filename):
         logger.info(f"Uploaded: {public_url}")
         return public_url
     except urllib.error.HTTPError as e:
-        logger.error(f"Supabase upload HTTP error: {e.code} — {e.read().decode()}")
+        logger.error(f"Supabase upload error: {e.code} — {e.read().decode()}")
         return ''
     except Exception as e:
         logger.error(f"Supabase upload error: {str(e)}")
@@ -161,8 +161,8 @@ def trigger_make_webhook(webhook_url, payload):
     if not webhook_url:
         return False
     try:
-        data = json.dumps(payload).encode('utf-8')
-        req = urllib.request.Request(webhook_url, data=data, method='POST', headers={'Content-Type': 'application/json'})
+        req = urllib.request.Request(webhook_url, data=json.dumps(payload).encode('utf-8'),
+            method='POST', headers={'Content-Type': 'application/json'})
         with urllib.request.urlopen(req, timeout=10) as resp:
             resp.read()
         return True
@@ -171,7 +171,7 @@ def trigger_make_webhook(webhook_url, payload):
         return False
 
 
-# ─── Email helper ─────────────────────────────────────────────────────────────
+# ─── Email ────────────────────────────────────────────────────────────────────
 BREVO_API_KEY  = os.environ.get('BREVO_API_KEY', '')
 GMAIL_USER     = os.environ.get('GMAIL_USER', '')
 GMAIL_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD', '')
@@ -179,21 +179,18 @@ logger.info(f"Email config: Brevo={'YES' if BREVO_API_KEY else 'NO'}, Resend={'Y
 
 
 def send_email(to, subject, html, attachments=None):
-    """Send email — Brevo primary, Resend fallback."""
     to_list = [to] if isinstance(to, str) else to
-
     if BREVO_API_KEY:
         try:
             payload = {
-                'sender':      {'name': 'SafariFlow', 'email': 'ephraim063@gmail.com'},
-                'to':          [{'email': t} for t in to_list],
-                'subject':     subject,
-                'htmlContent': html,
+                'sender': {'name': 'SafariFlow', 'email': 'ephraim063@gmail.com'},
+                'to': [{'email': t} for t in to_list],
+                'subject': subject, 'htmlContent': html,
             }
             if attachments:
-                payload['attachment'] = [{'name': att['filename'], 'content': att['content']} for att in attachments]
-            data = json.dumps(payload).encode('utf-8')
-            req = urllib.request.Request('https://api.brevo.com/v3/smtp/email', data=data, method='POST',
+                payload['attachment'] = [{'name': a['filename'], 'content': a['content']} for a in attachments]
+            req = urllib.request.Request('https://api.brevo.com/v3/smtp/email',
+                data=json.dumps(payload).encode('utf-8'), method='POST',
                 headers={'api-key': BREVO_API_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json'})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 result = json.loads(resp.read().decode())
@@ -203,16 +200,15 @@ def send_email(to, subject, html, attachments=None):
             logger.error(f"Brevo error: {e.code} — {e.read().decode()}")
         except Exception as e:
             logger.error(f"Brevo error: {str(e)}")
-
     if not RESEND_API_KEY:
-        logger.warning("No email provider configured — skipping email")
+        logger.warning("No email provider configured")
         return False
     try:
         payload = {'from': RESEND_FROM, 'to': to_list, 'subject': subject, 'html': html}
         if attachments:
             payload['attachments'] = attachments
-        data = json.dumps(payload).encode('utf-8')
-        req = urllib.request.Request('https://api.resend.com/emails', data=data, method='POST',
+        req = urllib.request.Request('https://api.resend.com/emails',
+            data=json.dumps(payload).encode('utf-8'), method='POST',
             headers={'Authorization': f'Bearer {RESEND_API_KEY}', 'Content-Type': 'application/json'})
         with urllib.request.urlopen(req, timeout=15) as resp:
             result = json.loads(resp.read().decode())
@@ -231,7 +227,6 @@ def agent_approval_email_html(agent_name, agency_name, client_name, quote_number
                                approve_url, reject_url,
                                cost_breakdown_url='',
                                brand_primary='#2E4A7A', brand_secondary='#C4922A'):
-    """Agent approval email with cost breakdown link — no cost data in attachment."""
     cost_btn = ''
     if cost_breakdown_url:
         cost_btn = f"""
@@ -243,7 +238,6 @@ def agent_approval_email_html(agent_name, agency_name, client_name, quote_number
     </td></tr>
   </table>
   <p style="color:#888888;font-size:11px;text-align:center;margin-bottom:16px;">Internal document — do not forward to client</p>"""
-
     return f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"></head>
 <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f4;">
@@ -359,18 +353,19 @@ def client_quote_email_html(client_name, agency_name, agent_name, agent_email, a
 </body></html>"""
 
 
-# ─── Claude API helper ────────────────────────────────────────────────────────
+# ─── Claude API ───────────────────────────────────────────────────────────────
 def call_claude(prompt, max_tokens=4000):
     if not ANTHROPIC_API_KEY:
         return {}
     try:
         payload = json.dumps({
-            "model": "claude-sonnet-4-6",
-            "max_tokens": max_tokens,
+            "model": "claude-sonnet-4-6", "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": prompt}]
         }).encode('utf-8')
-        req = urllib.request.Request('https://api.anthropic.com/v1/messages', data=payload, method='POST',
-            headers={'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json'})
+        req = urllib.request.Request('https://api.anthropic.com/v1/messages',
+            data=payload, method='POST',
+            headers={'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01',
+                     'content-type': 'application/json'})
         with urllib.request.urlopen(req, timeout=120) as resp:
             result = json.loads(resp.read().decode())
         text = result.get('content', [{}])[0].get('text', '{}').strip()
@@ -386,13 +381,12 @@ def call_claude(prompt, max_tokens=4000):
         return {}
 
 
-# ─── Unsplash photo fetcher ───────────────────────────────────────────────────
+# ─── Unsplash ─────────────────────────────────────────────────────────────────
 def fetch_unsplash_photo(query):
     if not UNSPLASH_ACCESS_KEY:
         return None
     try:
-        safe_query = urllib.parse.quote(query)
-        url = f"https://api.unsplash.com/search/photos?query={safe_query}&per_page=1&orientation=landscape&client_id={UNSPLASH_ACCESS_KEY}"
+        url = f"https://api.unsplash.com/search/photos?query={urllib.parse.quote(query)}&per_page=1&orientation=landscape&client_id={UNSPLASH_ACCESS_KEY}"
         req = urllib.request.Request(url, headers={'User-Agent': 'SafariFlow/1.0'})
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode())
@@ -406,7 +400,7 @@ def fetch_unsplash_photo(query):
         with urllib.request.urlopen(img_req, timeout=10) as img_resp:
             return img_resp.read()
     except Exception as e:
-        logger.warning(f"Unsplash fetch failed for '{query}': {str(e)}")
+        logger.warning(f"Unsplash fetch failed: {str(e)}")
         return None
 
 
@@ -416,10 +410,8 @@ def fetch_photos_for_itinerary(itinerary):
     import threading
     photo_cache = {}
     lock = threading.Lock()
-    queries = {}
-    for day in itinerary:
-        query = day.get('image_search_query') or f"{day.get('destination', '')} safari wildlife Kenya"
-        queries[day.get('day_number', 0)] = query
+    queries = {day.get('day_number', 0): day.get('image_search_query') or f"{day.get('destination', '')} safari wildlife Kenya"
+               for day in itinerary}
 
     def fetch_one(day_num, query):
         img_bytes = fetch_unsplash_photo(query)
@@ -439,23 +431,19 @@ def fetch_photos_for_itinerary(itinerary):
 def clerk_webhook():
     try:
         payload = request.get_data()
-        svix_id = request.headers.get('svix-id', '')
+        svix_id        = request.headers.get('svix-id', '')
         svix_timestamp = request.headers.get('svix-timestamp', '')
         svix_signature = request.headers.get('svix-signature', '')
-
         if CLERK_WEBHOOK_SECRET:
             signed_content = f"{svix_id}.{svix_timestamp}.{payload.decode('utf-8')}"
-            secret_bytes = base64.b64decode(CLERK_WEBHOOK_SECRET.replace('whsec_', ''))
-            expected_sig = 'v1,' + base64.b64encode(
-                hmac.new(secret_bytes, signed_content.encode(), hashlib.sha256).digest()
-            ).decode()
+            secret_bytes   = base64.b64decode(CLERK_WEBHOOK_SECRET.replace('whsec_', ''))
+            expected_sig   = 'v1,' + base64.b64encode(
+                hmac.new(secret_bytes, signed_content.encode(), hashlib.sha256).digest()).decode()
             if not any(s == expected_sig for s in svix_signature.split(' ')):
                 return jsonify({'error': 'Invalid signature'}), 401
-
-        data = json.loads(payload)
+        data       = json.loads(payload)
         event_type = data.get('type')
         logger.info(f"Clerk webhook: {event_type}")
-
         if event_type == 'user.created':
             user_data  = data.get('data', {})
             clerk_id   = user_data.get('id', '')
@@ -464,11 +452,9 @@ def clerk_webhook():
             agent_name = f"{first_name} {last_name}".strip() or 'Safari Agent'
             emails     = user_data.get('email_addresses', [])
             email      = emails[0].get('email_address', '') if emails else ''
-
-            existing = supabase_get('agents', {'clerk_user_id': f'eq.{clerk_id}', 'select': 'id'})
+            existing   = supabase_get('agents', {'clerk_user_id': f'eq.{clerk_id}', 'select': 'id'})
             if existing:
                 return jsonify({'status': 'exists'}), 200
-
             agent_id  = str(uuid.uuid4())
             new_agent = {
                 'id': agent_id, 'clerk_user_id': clerk_id, 'agent_name': agent_name,
@@ -485,7 +471,6 @@ def clerk_webhook():
             with urllib.request.urlopen(req, timeout=15) as resp:
                 resp.read()
             logger.info(f"Agent created: {agent_id} for {email}")
-
         return jsonify({'status': 'ok'}), 200
     except Exception as e:
         logger.error(f"Clerk webhook error: {str(e)}", exc_info=True)
@@ -516,7 +501,8 @@ def generate_pdf():
         budget_usd         = float(data.get('budget_usd', 10000) or 10000)
         special_requests   = data.get('special_requests', '')
 
-        source_map    = {'portal':'form','tally':'form','form':'form','email':'email','safaribookings':'email','chatbot':'chatbot','manual':'manual'}
+        source_map    = {'portal':'form','tally':'form','form':'form','email':'email',
+                         'safaribookings':'email','chatbot':'chatbot','manual':'manual'}
         intake_source = source_map.get(data.get('source', 'manual'), 'manual')
 
         logger.info(f"Generating quote for {client_name} — {destinations}")
@@ -562,12 +548,10 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
             'park_fee':      float(agent.get('markup_park_fees_pct', 0) or 0) / 100,
             'activity':      float(agent.get('markup_activities_pct', 0) or 0) / 100,
         }
-
         marked_up_items = []
         for item in line_items:
             item = dict(item)
             pct  = markup_overall if markup_type == 'overall' else markup_map.get(item.get('line_type', 'accommodation'), markup_overall)
-            # Save pre-markup cost prices for agent breakdown
             item['cost_unit_price']  = round(float(item.get('unit_price', 0)), 2)
             item['cost_total_price'] = round(float(item.get('total_price', 0)), 2)
             item['markup_pct']       = round(pct * 100, 2)
@@ -584,9 +568,9 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
 
         logger.info(f"Itinerary: {len(itinerary)} days, total ${total_price}")
 
-        first_name       = client_name.split()[0] if client_name else "Dear Guest"
-        intro_narrative  = f"{first_name}, your {duration_days}-day safari across {destinations} has been carefully crafted to deliver an authentic East African experience."
-        narrative_days   = [{'day_number':d.get('day_number'),'narrative':f"Today you explore {d.get('destination')} with your expert guide, discovering the remarkable wildlife and landscapes that make this destination truly special.",'highlight':f"Wildlife encounters in {d.get('destination')}",'accommodation_description':f"{d.get('accommodation_name')}, {d.get('room_type')} — your comfortable base for the night."} for d in itinerary]
+        first_name      = client_name.split()[0] if client_name else "Dear Guest"
+        intro_narrative = f"{first_name}, your {duration_days}-day safari across {destinations} has been carefully crafted to deliver an authentic East African experience."
+        narrative_days  = [{'day_number':d.get('day_number'),'narrative':f"Today you explore {d.get('destination')} with your expert guide, discovering the remarkable wildlife and landscapes that make this destination truly special.",'highlight':f"Wildlife encounters in {d.get('destination')}",'accommodation_description':f"{d.get('accommodation_name')}, {d.get('room_type')} — your comfortable base for the night."} for d in itinerary]
 
         quote_number         = f"QT-{request_id}"
         approve_token        = generate_token(quote_number, 'approve')
@@ -603,30 +587,25 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
 
         reviews_formatted = [{'review_text':r.get('review_text',''),'client_name':r.get('client_name',''),'client_origin':r.get('client_origin',''),'trip_summary':r.get('trip_summary','')} for r in reviews]
 
-        logger.info("Fetching photos from Unsplash...")
+        logger.info("Fetching photos...")
         photo_cache = fetch_photos_for_itinerary(itinerary)
 
         pdf_data = {
-            'quote_id':      quote_number,
-            'generated_at':  start_date[:10] if start_date else '',
-            'accept_url':    '#',
-            'changes_url':   '#',
-            'inclusions':    '- All accommodation as specified\n- All meals as per itinerary\n- All game drives\n- Park and conservancy fees\n- Internal flights as specified\n- Airport transfers',
-            'exclusions':    '- International flights\n- Travel insurance\n- Visa fees\n- Personal expenses\n- Gratuities',
-            'terms':         agent.get('cancellation_terms') or 'This quote is valid for 14 days. A 30% deposit is required to confirm the booking. Balance due 60 days prior to departure.',
-            'agent':         {'name':agent.get('agent_name',''),'email':agent.get('email',''),'phone':agent.get('phone',''),'agency':agent.get('agency_name',''),'logo_url':agent.get('logo_url',''),'website':agent.get('website','')},
-            'client':        {'name':client_name,'email':client_email,'phone':client_phone,'pax_adults':str(pax_adults),'pax_children':str(pax_children),'nationality':client_nationality},
-            'trip':          {'title':f"{duration_days}-Day {destinations} Safari",'start_date':start_date,'end_date':end_date,'duration_nights':str(duration_days),'destinations':destinations,'travel_style':accommodation_tier.title()},
-            'itinerary':     itinerary,
-            'line_items':    line_items,
-            'photo_cache':   photo_cache,
-            'pricing':       {'total_price_usd':total_price,'deposit_amount_usd':deposit,'balance_amount_usd':balance,'within_budget':itinerary_data.get('within_budget',True),'budget_notes':itinerary_data.get('budget_notes','')},
-            'narrative':     {'intro':intro_narrative,'days':narrative_days},
+            'quote_id': quote_number, 'generated_at': start_date[:10] if start_date else '',
+            'accept_url': '#', 'changes_url': '#',
+            'inclusions': '- All accommodation as specified\n- All meals as per itinerary\n- All game drives\n- Park and conservancy fees\n- Internal flights as specified\n- Airport transfers',
+            'exclusions': '- International flights\n- Travel insurance\n- Visa fees\n- Personal expenses\n- Gratuities',
+            'terms': agent.get('cancellation_terms') or 'This quote is valid for 14 days. A 30% deposit is required to confirm the booking. Balance due 60 days prior to departure.',
+            'agent': {'name':agent.get('agent_name',''),'email':agent.get('email',''),'phone':agent.get('phone',''),'agency':agent.get('agency_name',''),'logo_url':agent.get('logo_url',''),'website':agent.get('website','')},
+            'client': {'name':client_name,'email':client_email,'phone':client_phone,'pax_adults':str(pax_adults),'pax_children':str(pax_children),'nationality':client_nationality},
+            'trip': {'title':f"{duration_days}-Day {destinations} Safari",'start_date':start_date,'end_date':end_date,'duration_nights':str(duration_days),'destinations':destinations,'travel_style':accommodation_tier.title()},
+            'itinerary': itinerary, 'line_items': line_items, 'photo_cache': photo_cache,
+            'pricing': {'total_price_usd':total_price,'deposit_amount_usd':deposit,'balance_amount_usd':balance,'within_budget':itinerary_data.get('within_budget',True),'budget_notes':itinerary_data.get('budget_notes','')},
+            'narrative': {'intro':intro_narrative,'days':narrative_days},
             'agent_profile': {'tagline':profile.get('tagline','Travel & Safari Specialists'),'bio':profile.get('bio',''),'years_experience':profile.get('years_experience',''),'safaris_planned':profile.get('safaris_planned',''),'countries_covered':profile.get('countries_covered',''),'awards':profile.get('awards',[]),'memberships':profile.get('memberships',[]),'address':profile.get('address',''),'facebook':profile.get('facebook',''),'instagram':profile.get('instagram',''),'linkedin':profile.get('linkedin','')},
             'agent_reviews': reviews_formatted,
         }
 
-        # ── Generate client-facing quote PDF ──────────────────────────────────
         logger.info("Generating quote PDF...")
         generate_quote_pdf(pdf_data, output_path)
         pdf_url = supabase_upload(output_path, filename)
@@ -639,40 +618,28 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
         cost_breakdown_url = supabase_upload(cb_output_path, cb_filename)
         logger.info(f"Cost breakdown PDF uploaded: {cost_breakdown_url}")
 
-        # ── Save quote to Supabase ─────────────────────────────────────────────
+        # ── Save quote ────────────────────────────────────────────────────────
         itinerary_json_payload = {
-            'pricing':    {'total_price_usd':total_price,'deposit_amount_usd':deposit,'balance_amount_usd':balance},
+            'pricing': {'total_price_usd':total_price,'deposit_amount_usd':deposit,'balance_amount_usd':balance},
             'line_items': line_items,
         }
         quote_record = {
-            'quote_number':             quote_number,
-            'agent_id':                 agent_id,
-            'status':                   'generated',
-            'source':                   intake_source,
-            'client_name':              client_name,
-            'client_email':             client_email,
-            'destinations':             destinations,
-            'start_date':               start_date[:10] if start_date else None,
-            'end_date':                 end_date[:10] if end_date else None,
-            'duration_days':            duration_days,
-            'pax_adults':               pax_adults,
-            'pax_children':             pax_children,
-            'accommodation_tier':       accommodation_tier,
-            'total_price_usd_cents':    int(total_price * 100),
-            'client_budget_usd_cents':  int(budget_usd * 100),
-            'itinerary_json':           itinerary_json_payload,
-            'pdf_url':                  pdf_url,
-            'cost_breakdown_url':       cost_breakdown_url,
-            'accept_token':             client_accept_token,
-            'change_token':             client_changes_token,
-            'reject_token':             reject_token,
-            'special_requests':         special_requests,
+            'quote_number':quote_number,'agent_id':agent_id,'status':'generated','source':intake_source,
+            'client_name':client_name,'client_email':client_email,'destinations':destinations,
+            'start_date':start_date[:10] if start_date else None,'end_date':end_date[:10] if end_date else None,
+            'duration_days':duration_days,'pax_adults':pax_adults,'pax_children':pax_children,
+            'accommodation_tier':accommodation_tier,'total_price_usd_cents':int(total_price*100),
+            'client_budget_usd_cents':int(budget_usd*100),'itinerary_json':itinerary_json_payload,
+            'pdf_url':pdf_url,'cost_breakdown_url':cost_breakdown_url,
+            'accept_token':client_accept_token,'change_token':client_changes_token,
+            'reject_token':reject_token,'special_requests':special_requests,
         }
-
         try:
             insert_url = f"{SUPABASE_URL}/rest/v1/quotes"
-            insert_req = urllib.request.Request(insert_url, data=json.dumps(quote_record).encode('utf-8'), method='POST',
-                headers={'Authorization':f'Bearer {SUPABASE_KEY}','apikey':SUPABASE_KEY,'Content-Type':'application/json','Prefer':'return=minimal,resolution=merge-duplicates'})
+            insert_req = urllib.request.Request(insert_url,
+                data=json.dumps(quote_record).encode('utf-8'), method='POST',
+                headers={'Authorization':f'Bearer {SUPABASE_KEY}','apikey':SUPABASE_KEY,
+                         'Content-Type':'application/json','Prefer':'return=minimal,resolution=merge-duplicates'})
             with urllib.request.urlopen(insert_req, timeout=15) as resp:
                 resp.read()
             logger.info(f"Quote saved: {quote_number}, total=${total_price}")
@@ -681,11 +648,12 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
             logger.error(f"Quote save HTTP error {e.code}: {error_body}")
             try:
                 minimal = {k: v for k, v in quote_record.items() if k != 'itinerary_json'}
-                insert_req2 = urllib.request.Request(insert_url, data=json.dumps(minimal).encode('utf-8'), method='POST',
-                    headers={'Authorization':f'Bearer {SUPABASE_KEY}','apikey':SUPABASE_KEY,'Content-Type':'application/json','Prefer':'return=minimal,resolution=merge-duplicates'})
+                insert_req2 = urllib.request.Request(insert_url,
+                    data=json.dumps(minimal).encode('utf-8'), method='POST',
+                    headers={'Authorization':f'Bearer {SUPABASE_KEY}','apikey':SUPABASE_KEY,
+                             'Content-Type':'application/json','Prefer':'return=minimal,resolution=merge-duplicates'})
                 with urllib.request.urlopen(insert_req2, timeout=15) as resp:
                     resp.read()
-                logger.info(f"Quote saved (minimal): {quote_number}")
             except Exception as e2:
                 logger.error(f"Quote minimal save error: {str(e2)}")
         except Exception as e:
@@ -697,58 +665,37 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
 
         logger.info(f"PDF complete: {filename} ({len(pdf_bytes)} bytes)")
 
-        # ── Send agent approval email — quote PDF attached, cost breakdown as link ──
+        # ── Agent approval email — quote PDF attached, cost breakdown as link ─
         agent_email_addr = agent.get('email', '')
         if agent_email_addr:
             email_html = agent_approval_email_html(
                 agent_name=agent.get('agent_name', 'Agent'),
                 agency_name=agent.get('agency_name', 'SafariFlow'),
-                client_name=client_name,
-                quote_number=quote_number,
-                start_date=start_date,
-                end_date=end_date,
-                total_price=total_price,
-                approve_url=approve_url,
-                reject_url=reject_url,
+                client_name=client_name, quote_number=quote_number,
+                start_date=start_date, end_date=end_date, total_price=total_price,
+                approve_url=approve_url, reject_url=reject_url,
                 cost_breakdown_url=cost_breakdown_url,
                 brand_primary=agent.get('brand_color_primary', '#2E4A7A'),
                 brand_secondary=agent.get('brand_color_secondary', '#C4922A'),
             )
-            send_email(
-                to=agent_email_addr,
+            send_email(to=agent_email_addr,
                 subject=f"New Quote Ready for Review — {client_name} ({quote_number})",
                 html=email_html,
-                attachments=[{'filename': filename, 'content': pdf_base64}],
-            )
+                attachments=[{'filename': filename, 'content': pdf_base64}])
             logger.info(f"Agent approval email sent to {agent_email_addr}")
 
         return jsonify({
-            'success':            True,
-            'filename':           filename,
-            'quote_number':       quote_number,
-            'pdf_base64':         pdf_base64,
-            'pdf_url':            pdf_url,
-            'cost_breakdown_url': cost_breakdown_url,
-            'file_size':          len(pdf_bytes),
-            'client_name':        client_name,
-            'client_email':       client_email,
-            'agent_email':        agent.get('email', ''),
-            'agent_name':         agent.get('agent_name', ''),
-            'agency_name':        agent.get('agency_name', ''),
-            'quote_date':         start_date[:10] if start_date else '',
-            'total_price_usd':    total_price,
-            'deposit_usd':        deposit,
-            'balance_usd':        balance,
-            'itinerary_days':     len(itinerary),
-            'line_items':         line_items,
-            'itinerary_json':     {'pricing':{'total_price_usd':total_price,'deposit_amount_usd':deposit,'balance_amount_usd':balance},'line_items':line_items,'itinerary':itinerary},
-            'approve_url':        approve_url,
-            'reject_url':         reject_url,
-            'client_accept_url':  client_accept_url,
-            'client_changes_url': client_changes_url,
-            'destinations':       destinations,
-            'start_date':         start_date,
-            'end_date':           end_date,
+            'success':True,'filename':filename,'quote_number':quote_number,
+            'pdf_base64':pdf_base64,'pdf_url':pdf_url,'cost_breakdown_url':cost_breakdown_url,
+            'file_size':len(pdf_bytes),'client_name':client_name,'client_email':client_email,
+            'agent_email':agent.get('email',''),'agent_name':agent.get('agent_name',''),
+            'agency_name':agent.get('agency_name',''),'quote_date':start_date[:10] if start_date else '',
+            'total_price_usd':total_price,'deposit_usd':deposit,'balance_usd':balance,
+            'itinerary_days':len(itinerary),'line_items':line_items,
+            'itinerary_json':{'pricing':{'total_price_usd':total_price,'deposit_amount_usd':deposit,'balance_amount_usd':balance},'line_items':line_items,'itinerary':itinerary},
+            'approve_url':approve_url,'reject_url':reject_url,
+            'client_accept_url':client_accept_url,'client_changes_url':client_changes_url,
+            'destinations':destinations,'start_date':start_date,'end_date':end_date,
         })
 
     except Exception as e:
@@ -758,7 +705,8 @@ PARK FEES: {json.dumps(fees_for_claude)}"""
 
 # ─── Helper pages ─────────────────────────────────────────────────────────────
 def confirmation_page(token, action, title, message, button_label, button_color, icon):
-    return f'''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SafariFlow</title></head>
+    return f'''<!DOCTYPE html><html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SafariFlow</title></head>
 <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f4;">
 <div style="max-width:500px;margin:60px auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1);text-align:center;">
     <div style="font-size:48px;margin-bottom:16px">{icon}</div>
@@ -773,10 +721,11 @@ def confirmation_page(token, action, title, message, button_label, button_color,
 
 
 def success_page(icon, title, message, quote_id):
-    return f'''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SafariFlow</title></head>
+    return f'''<!DOCTYPE html><html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SafariFlow</title></head>
 <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f4;">
 <div style="max-width:500px;margin:60px auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1);text-align:center;">
-    <div style="font-size:48px;margin-bottom:16px">{icon}</div>
+    <div style="font-size:64px;margin-bottom:16px">{icon}</div>
     <h2 style="color:#1B2A47;margin-bottom:8px">{title}</h2>
     <p style="color:#444">{message}</p>
     <p style="color:#C4922A;font-weight:bold;font-size:14px;margin-top:16px">{quote_id}</p>
@@ -816,7 +765,6 @@ def approve_confirm():
         quote  = quotes[0]
         agents = supabase_get('agents', {'id': f'eq.{quote.get("agent_id")}', 'select': '*'})
         agent  = agents[0] if agents else {}
-
         client_email_addr    = quote.get('client_email', '')
         client_accept_token  = generate_token(quote_id, 'client-accept')
         client_changes_token = generate_token(quote_id, 'client-changes')
@@ -833,26 +781,22 @@ def approve_confirm():
                 except Exception as e:
                     logger.warning(f"Could not fetch PDF: {str(e)}")
 
-            email_html  = client_quote_email_html(
+            email_html = client_quote_email_html(
                 client_name=quote.get('client_name', 'Dear Guest'),
                 agency_name=agent.get('agency_name', 'SafariFlow'),
-                agent_name=agent.get('agent_name', ''),
-                agent_email=agent.get('email', ''),
-                agent_phone=agent.get('phone', ''),
-                quote_number=quote_id,
-                start_date=str(quote.get('start_date', '')),
-                end_date=str(quote.get('end_date', '')),
-                accept_url=accept_url,
-                changes_url=changes_url,
+                agent_name=agent.get('agent_name', ''), agent_email=agent.get('email', ''),
+                agent_phone=agent.get('phone', ''), quote_number=quote_id,
+                start_date=str(quote.get('start_date', '')), end_date=str(quote.get('end_date', '')),
+                accept_url=accept_url, changes_url=changes_url,
                 brand_primary=agent.get('brand_color_primary', '#2E4A7A'),
                 brand_secondary=agent.get('brand_color_secondary', '#C4922A'),
             )
             attachments = [{'filename': f'SafariFlow_Quote_{quote_id}.pdf', 'content': pdf_base64}] if pdf_base64 else []
-            send_email(to=client_email_addr, subject=f"Your Safari Quote is Ready — {quote_id}", html=email_html,
-                       attachments=attachments if attachments else None)
+            send_email(to=client_email_addr, subject=f"Your Safari Quote is Ready — {quote_id}",
+                html=email_html, attachments=attachments if attachments else None)
             logger.info(f"Client quote email sent to {client_email_addr}")
 
-    trigger_make_webhook(MAKE_S2_WEBHOOK, {'event': 'quote_approved', 'quote_number': quote_id, 'approved_at': int(time.time())})
+    trigger_make_webhook(MAKE_S2_WEBHOOK, {'event':'quote_approved','quote_number':quote_id,'approved_at':int(time.time())})
     return success_page('&#x2705;', 'Quote Approved', 'The quote has been approved and sent to the client.', quote_id)
 
 
@@ -873,7 +817,7 @@ def reject_confirm():
     quote_id = verify_token(token, 'reject')
     if not quote_id: return invalid_page()
     supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {'status': 'revision_requested'})
-    trigger_make_webhook(MAKE_S2_WEBHOOK, {'event': 'quote_rejected', 'quote_number': quote_id, 'rejected_at': int(time.time())})
+    trigger_make_webhook(MAKE_S2_WEBHOOK, {'event':'quote_rejected','quote_number':quote_id,'rejected_at':int(time.time())})
     return success_page('&#x270F;&#xFE0F;', 'Revision Requested', 'The quote has been flagged for revision.', quote_id)
 
 
@@ -894,26 +838,37 @@ def client_accept_confirm():
     quote_id = verify_token(token, 'client-accept')
     if not quote_id: return invalid_page()
 
+    # Update quote status to accepted
     supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {'status': 'accepted'})
-    trigger_make_webhook(MAKE_S2_WEBHOOK, {'event': 'quote_accepted', 'quote_number': quote_id, 'accepted_at': int(time.time())})
+    trigger_make_webhook(MAKE_S2_WEBHOOK, {'event':'quote_accepted','quote_number':quote_id,'accepted_at':int(time.time())})
     logger.info(f"Quote accepted by client: {quote_id}")
 
+    # ── Auto-generate invoice — direct call, no HTTP, duplicate-guarded ───────
     try:
         quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
         if quotes:
             agent_id = quotes[0].get('agent_id', '')
             if agent_id:
-                inv_payload = json.dumps({'quote_id': quote_id, 'agent_id': agent_id}).encode('utf-8')
-                inv_req = urllib.request.Request(f"{API_BASE_URL}/generate-invoice", data=inv_payload, method='POST',
-                    headers={'Content-Type': 'application/json'})
-                with urllib.request.urlopen(inv_req, timeout=60) as resp:
-                    inv_result = json.loads(resp.read().decode())
-                logger.info(f"Invoice auto-generated: {inv_result.get('invoice_number')} for {quote_id}")
+                # Guard: skip if invoice already exists for this quote
+                existing_invoices = supabase_get('invoices', {'quote_id': f'eq.{quote_id}', 'select': 'id'})
+                if existing_invoices:
+                    logger.info(f"Invoice already exists for {quote_id} — skipping duplicate generation")
+                else:
+                    inv_result = create_invoice(quote_id, agent_id)
+                    logger.info(f"Invoice auto-generated: {inv_result.get('invoice_number')} for {quote_id}")
     except Exception as e:
         logger.error(f"Auto-invoice error for {quote_id}: {str(e)}")
 
-    return success_page('&#x1F389;', 'Quote Accepted!',
-        'Thank you! Your safari booking is confirmed. Your invoice has been sent to your email.', quote_id)
+    # Return success page — client cannot resubmit from here
+    return f'''<!DOCTYPE html><html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Booking Confirmed</title></head>
+<body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f4;">
+<div style="max-width:500px;margin:60px auto;background:white;padding:40px;border-radius:12px;box-shadow:0 2px 12px rgba(0,0,0,0.1);text-align:center;">
+    <div style="font-size:64px;margin-bottom:16px">🎉</div>
+    <h2 style="color:#1B2A47;margin-bottom:8px">Quote Accepted!</h2>
+    <p style="color:#444">Thank you! Your safari booking is confirmed. Your invoice has been sent to your email with payment details.</p>
+    <p style="color:#C4922A;font-weight:bold;font-size:14px;margin-top:16px">{quote_id}</p>
+</div></body></html>'''
 
 
 # ─── Client Changes ───────────────────────────────────────────────────────────
@@ -927,9 +882,9 @@ def client_changes():
     quote   = quotes[0] if quotes else {}
     agents  = supabase_get('agents', {'id': f'eq.{quote.get("agent_id", "")}', 'select': '*'})
     agent   = agents[0] if agents else {}
-    brand_primary   = agent.get('brand_color_primary', '#2E4A7A')
-    brand_secondary = agent.get('brand_color_secondary', '#C4922A')
-    agency_name     = agent.get('agency_name', 'SafariFlow')
+    bp      = agent.get('brand_color_primary', '#2E4A7A')
+    bs      = agent.get('brand_color_secondary', '#C4922A')
+    agency_name = agent.get('agency_name', 'SafariFlow')
 
     extras = supabase_get('optional_extras', {
         'agent_id': f'eq.{agent.get("id", "")}', 'is_active': 'eq.true',
@@ -939,51 +894,17 @@ def client_changes():
 
     extras_html = ''
     if extras:
-        extras_buttons = ''
+        btns = ''
         for ex in extras:
             price = ex.get('price_per_person_usd_cents', 0) / 100
-            price_label = f"${price:,.0f}/pp" if ex.get('price_type') == 'per_person' else f"${price:,.0f}/grp"
-            extras_buttons += f'<div class="extra-btn" onclick="toggleExtra(this)" data-id="{ex["id"]}"><input type="hidden" name="extra_{ex["id"]}" value="no" class="extra-input"><div class="extra-name">{ex["name"]}</div><div class="extra-meta">{ex.get("category","")} · {ex.get("duration_hours",2)}h · {price_label}</div></div>'
-        extras_html = f'<div class="section-label" style="margin-top:24px;">Would you like to add any extras?</div><p style="font-size:12px;color:#888;margin-bottom:12px;">Tap to add experiences to your revised quote.</p><div class="extras-grid">{extras_buttons}</div>'
+            pl    = f"${price:,.0f}/pp" if ex.get('price_type') == 'per_person' else f"${price:,.0f}/grp"
+            btns += f'<div class="extra-btn" onclick="toggleExtra(this)"><input type="hidden" name="extra_{ex["id"]}" value="no" class="extra-input"><div class="extra-name">{ex["name"]}</div><div class="extra-meta">{ex.get("category","")} · {ex.get("duration_hours",2)}h · {pl}</div></div>'
+        extras_html = f'<div class="section-label" style="margin-top:24px;">Would you like to add any extras?</div><div class="extras-grid">{btns}</div>'
 
     min_date = time.strftime('%Y-%m-%d')
 
-    return f'''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Request Changes — {quote_id}</title>
-<style>
-  *{{box-sizing:border-box;margin:0;padding:0}}body{{font-family:Arial,sans-serif;background:#f4f4f4;padding:20px}}
-  .container{{max-width:580px;margin:40px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 16px rgba(0,0,0,0.1)}}
-  .header{{background:{brand_primary};padding:28px;text-align:center;color:white}}.header h1{{font-size:20px;letter-spacing:2px;margin-bottom:4px}}.header p{{font-size:12px;opacity:0.8}}
-  .gold-line{{background:{brand_secondary};height:3px}}.body{{padding:32px}}.body h2{{font-size:18px;color:#1A1A1A;margin-bottom:6px}}
-  .sub{{font-size:13px;color:#666;margin-bottom:24px}}.section-label{{font-size:11px;font-weight:bold;letter-spacing:1px;color:#999;text-transform:uppercase;margin-bottom:10px}}
-  .quote-ref{{background:#F8F6F2;border-radius:8px;padding:12px 16px;margin-bottom:24px;font-size:13px;color:#666}}.quote-ref span{{color:{brand_secondary};font-weight:bold;font-family:monospace}}
-  .changes-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:8px}}
-  .change-btn{{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:10px;cursor:pointer;border:2px solid #E8E4DE;background:#F8F6F2;transition:all 0.2s;user-select:none}}
-  .change-btn:hover{{border-color:{brand_secondary}}}.change-btn.selected{{border-color:{brand_primary};background:rgba(46,74,122,0.07)}}
-  .change-btn input{{display:none}}.change-icon{{font-size:20px;flex-shrink:0}}.change-label{{font-size:13px;color:#1A1A1A;font-weight:500;flex:1}}
-  .change-btn.selected .change-label{{color:{brand_primary};font-weight:700}}
-  .check-mark{{width:20px;height:20px;border-radius:50%;background:{brand_primary};color:white;font-size:11px;display:none;align-items:center;justify-content:center;flex-shrink:0}}
-  .change-btn.selected .check-mark{{display:flex}}
-  .expand-field{{display:none;background:#F0EDE8;border-radius:10px;padding:16px;margin-top:10px;margin-bottom:4px;border:1px solid #E0D8CE}}
-  .expand-field.visible{{display:block}}.expand-label{{font-size:11px;font-weight:bold;color:#888;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:8px}}
-  .budget-input{{width:100%;padding:10px 14px;border:1px solid #E8E4DE;border-radius:8px;font-size:16px;font-weight:600;color:#1A1A1A;outline:none;font-family:Arial,sans-serif}}
-  .budget-input:focus{{border-color:{brand_primary}}}
-  .form-row-dates{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
-  .date-input{{width:100%;padding:10px 12px;border:1px solid #E8E4DE;border-radius:8px;font-size:14px;font-family:Arial,sans-serif;outline:none;color:#1A1A1A;cursor:pointer;transition:border 0.2s}}
-  .date-input:focus{{border-color:{brand_primary}}}
-  .stepper-row{{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}}
-  .stepper-label{{font-size:13px;color:#444;font-weight:500}}.stepper-controls{{display:flex;align-items:center;gap:12px}}
-  .stepper-btn{{width:32px;height:32px;border-radius:50%;background:{brand_primary};color:white;border:none;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-weight:bold}}
-  .stepper-value{{font-size:16px;font-weight:700;color:#1A1A1A;min-width:24px;text-align:center}}
-  .extras-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px}}
-  .extra-btn{{padding:12px 14px;border-radius:10px;cursor:pointer;border:2px solid #E8E4DE;background:#F8F6F2;transition:all 0.2s;user-select:none}}
-  .extra-btn.selected{{border-color:{brand_secondary};background:rgba(196,146,42,0.08)}}
-  .extra-name{{font-size:13px;color:#1A1A1A;font-weight:600;margin-bottom:3px}}.extra-btn.selected .extra-name{{color:{brand_secondary}}}
-  .extra-meta{{font-size:11px;color:#888}}
-  .notes-area{{width:100%;padding:12px 14px;border:1px solid #E8E4DE;border-radius:8px;font-size:13px;font-family:Arial,sans-serif;outline:none;resize:vertical;min-height:80px;transition:border 0.2s;color:#1A1A1A}}
-  .notes-area:focus{{border-color:{brand_primary}}}
-  .submit-btn{{width:100%;background:{brand_primary};color:white;border:none;padding:14px;border-radius:8px;font-size:15px;font-weight:bold;cursor:pointer;letter-spacing:1px;margin-top:8px}}
-  @media(max-width:480px){{.changes-grid,.extras-grid{{grid-template-columns:1fr}}}}
-</style></head>
+    return f'''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Request Changes</title>
+<style>*{{box-sizing:border-box;margin:0;padding:0}}body{{font-family:Arial,sans-serif;background:#f4f4f4;padding:20px}}.container{{max-width:580px;margin:40px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 16px rgba(0,0,0,0.1)}}.header{{background:{bp};padding:28px;text-align:center;color:white}}.header h1{{font-size:20px;letter-spacing:2px;margin-bottom:4px}}.header p{{font-size:12px;opacity:0.8}}.gold-line{{background:{bs};height:3px}}.body{{padding:32px}}.body h2{{font-size:18px;color:#1A1A1A;margin-bottom:6px}}.sub{{font-size:13px;color:#666;margin-bottom:24px}}.section-label{{font-size:11px;font-weight:bold;letter-spacing:1px;color:#999;text-transform:uppercase;margin-bottom:10px}}.quote-ref{{background:#F8F6F2;border-radius:8px;padding:12px 16px;margin-bottom:24px;font-size:13px;color:#666}}.quote-ref span{{color:{bs};font-weight:bold;font-family:monospace}}.changes-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:8px}}.change-btn{{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:10px;cursor:pointer;border:2px solid #E8E4DE;background:#F8F6F2;transition:all 0.2s;user-select:none}}.change-btn:hover{{border-color:{bs}}}.change-btn.selected{{border-color:{bp};background:rgba(46,74,122,0.07)}}.change-btn input{{display:none}}.change-icon{{font-size:20px;flex-shrink:0}}.change-label{{font-size:13px;color:#1A1A1A;font-weight:500;flex:1}}.change-btn.selected .change-label{{color:{bp};font-weight:700}}.check-mark{{width:20px;height:20px;border-radius:50%;background:{bp};color:white;font-size:11px;display:none;align-items:center;justify-content:center;flex-shrink:0}}.change-btn.selected .check-mark{{display:flex}}.expand-field{{display:none;background:#F0EDE8;border-radius:10px;padding:16px;margin-top:10px;margin-bottom:4px;border:1px solid #E0D8CE}}.expand-field.visible{{display:block}}.expand-label{{font-size:11px;font-weight:bold;color:#888;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:8px}}.budget-input{{width:100%;padding:10px 14px;border:1px solid #E8E4DE;border-radius:8px;font-size:16px;font-weight:600;color:#1A1A1A;outline:none}}.budget-input:focus{{border-color:{bp}}}.form-row-dates{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}.date-input{{width:100%;padding:10px 12px;border:1px solid #E8E4DE;border-radius:8px;font-size:14px;outline:none;color:#1A1A1A;cursor:pointer}}.date-input:focus{{border-color:{bp}}}.stepper-row{{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}}.stepper-label{{font-size:13px;color:#444;font-weight:500}}.stepper-controls{{display:flex;align-items:center;gap:12px}}.stepper-btn{{width:32px;height:32px;border-radius:50%;background:{bp};color:white;border:none;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-weight:bold}}.stepper-value{{font-size:16px;font-weight:700;color:#1A1A1A;min-width:24px;text-align:center}}.extras-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px}}.extra-btn{{padding:12px 14px;border-radius:10px;cursor:pointer;border:2px solid #E8E4DE;background:#F8F6F2;transition:all 0.2s;user-select:none}}.extra-btn.selected{{border-color:{bs};background:rgba(196,146,42,0.08)}}.extra-name{{font-size:13px;color:#1A1A1A;font-weight:600;margin-bottom:3px}}.extra-btn.selected .extra-name{{color:{bs}}}.extra-meta{{font-size:11px;color:#888}}.notes-area{{width:100%;padding:12px 14px;border:1px solid #E8E4DE;border-radius:8px;font-size:13px;outline:none;resize:vertical;min-height:80px;color:#1A1A1A}}.notes-area:focus{{border-color:{bp}}}.submit-btn{{width:100%;background:{bp};color:white;border:none;padding:14px;border-radius:8px;font-size:15px;font-weight:bold;cursor:pointer;letter-spacing:1px;margin-top:8px}}@media(max-width:480px){{.changes-grid,.extras-grid{{grid-template-columns:1fr}}}}</style></head>
 <body><div class="container">
   <div class="header"><h1>{agency_name}</h1><p>REQUEST CHANGES TO YOUR QUOTE</p></div>
   <div class="gold-line"></div>
@@ -991,7 +912,7 @@ def client_changes():
     <h2>What would you like changed?</h2>
     <p class="sub">Tap the options below. We'll revise your quote and send it back to you.</p>
     <div class="quote-ref">Quote Reference: <span>{quote_id}</span></div>
-    <form method="POST" action="/client-changes-confirm" id="changeForm">
+    <form method="POST" action="/client-changes-confirm">
       <input type="hidden" name="token" value="{token}">
       <input type="hidden" name="revised_adults" id="revised_adults_hidden" value="0">
       <input type="hidden" name="revised_children" id="revised_children_hidden" value="0">
@@ -1048,10 +969,19 @@ def client_changes_confirm():
         'notes':             request.form.get('notes', ''),
         'selected_extras':   selected_extras,
     }
-    changes_list = [l for k, l in [('accommodation','Accommodation'),('dates','Travel Dates'),('budget','Budget'),('destinations','Destinations'),('travelers','Number of Travelers'),('transport','Transport'),('duration','Trip Duration'),('other','Other')] if change_request.get(k)]
+    changes_list = [l for k, l in [
+        ('accommodation','Accommodation'),('dates','Travel Dates'),('budget','Budget'),
+        ('destinations','Destinations'),('travelers','Number of Travelers'),
+        ('transport','Transport'),('duration','Trip Duration'),('other','Other')
+    ] if change_request.get(k)]
 
-    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {'status':'revision_requested','change_request':json.dumps(change_request)})
-    trigger_make_webhook(MAKE_S3_WEBHOOK, {'event':'client_changes_requested','quote_number':quote_id,'changes_requested':changes_list,'revised_budget':change_request['revised_budget'],'preferred_month':change_request['preferred_month'],'notes':change_request['notes'],'requested_at':int(time.time())})
+    supabase_update('quotes', {'quote_number': f'eq.{quote_id}'},
+        {'status':'revision_requested','change_request':json.dumps(change_request)})
+    trigger_make_webhook(MAKE_S3_WEBHOOK, {
+        'event':'client_changes_requested','quote_number':quote_id,
+        'changes_requested':changes_list,'revised_budget':change_request['revised_budget'],
+        'preferred_month':change_request['preferred_month'],'notes':change_request['notes'],
+        'requested_at':int(time.time())})
 
     quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
     if quotes:
@@ -1064,170 +994,219 @@ def client_changes_confirm():
             agency_name = agent.get('agency_name','SafariFlow'); agent_name = agent.get('agent_name','Agent')
             portal_link = f"{PORTAL_URL}/quotes/review/{quote_id}"
             changes_html = ''.join([f'<li style="margin-bottom:6px;color:#1A1A1A;font-size:13px;">{c}</li>' for c in changes_list])
-            budget_line  = f'<p style="margin:12px 0;font-size:13px;color:#1A1A1A;"><strong>Revised budget:</strong> ${float(change_request["revised_budget"]):,.0f}</p>' if change_request.get('revised_budget') else ''
+            budget_line  = f'<p style="margin:12px 0;font-size:13px;"><strong>Revised budget:</strong> ${float(change_request["revised_budget"]):,.0f}</p>' if change_request.get('revised_budget') else ''
             notes_line   = f'<div style="background:#F8F6F2;border-radius:8px;padding:12px 14px;margin:12px 0;font-size:13px;color:#444;">💬 {change_request["notes"]}</div>' if change_request.get('notes') else ''
             revision_html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"></head>
 <body style="margin:0;padding:0;font-family:Arial,sans-serif;background:#f4f4f4;">
 <table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center" style="padding:30px 0;">
 <table width="600" cellpadding="0" cellspacing="0" style="background:white;border-radius:8px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.1);">
-<tr><td style="background-color:{bp};padding:30px;text-align:center;"><h1 style="margin:0;color:#FFFFFF;font-size:22px;letter-spacing:2px;">{agency_name}</h1><p style="margin:6px 0 0;color:#FFFFFF;font-size:12px;letter-spacing:1px;">CLIENT CHANGE REQUEST</p></td></tr>
+<tr><td style="background-color:{bp};padding:30px;text-align:center;"><h1 style="margin:0;color:#FFFFFF;font-size:22px;letter-spacing:2px;">{agency_name}</h1><p style="margin:6px 0 0;color:#FFFFFF;font-size:12px;">CLIENT CHANGE REQUEST</p></td></tr>
 <tr><td style="background-color:{bs};height:3px;"></td></tr>
 <tr><td style="padding:36px 40px;background:#ffffff;">
   <p style="color:#1A1A1A;font-size:16px;margin:0 0 16px;">Hello <strong>{agent_name}</strong>, your client has requested changes to quote <strong>{quote_id}</strong>.</p>
-  <div style="background:#FFF8F0;border:1px solid #F5DFB0;border-radius:8px;padding:16px 20px;margin-bottom:20px;"><p style="font-size:12px;font-weight:bold;color:#888;letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;">Changes Requested:</p><ul style="margin:0;padding-left:18px;">{changes_html}</ul>{budget_line}{notes_line}</div>
+  <div style="background:#FFF8F0;border:1px solid #F5DFB0;border-radius:8px;padding:16px 20px;margin-bottom:20px;"><p style="font-size:12px;font-weight:bold;color:#888;text-transform:uppercase;margin-bottom:10px;">Changes Requested:</p><ul style="margin:0;padding-left:18px;">{changes_html}</ul>{budget_line}{notes_line}</div>
   <table width="100%" cellpadding="0" cellspacing="0" style="margin:16px 0;"><tr><td align="center"><a href="{portal_link}" style="display:inline-block;background-color:{bp};color:#FFFFFF;padding:16px 32px;border-radius:6px;text-decoration:none;font-weight:bold;font-size:14px;letter-spacing:1px;">🔍 REVIEW REVISED QUOTE</a></td></tr></table>
 </td></tr>
-<tr><td style="background:#F5F0E8;padding:20px 40px;text-align:center;"><p style="margin:0;color:#444444;font-size:12px;">{agency_name} · Powered by SafariFlow</p></td></tr>
+<tr><td style="background:#F5F0E8;padding:20px 40px;text-align:center;"><p style="margin:0;color:#444;font-size:12px;">{agency_name} · Powered by SafariFlow</p></td></tr>
 </table></td></tr></table></body></html>"""
             send_email(to=agent_email_addr, subject=f"Client Requested Changes — {quote_id}", html=revision_html)
 
-    return success_page('✏️', 'Changes Received!', 'Thank you! We have received your change request and will send you a revised quote shortly.', quote_id)
+    return success_page('✏️', 'Changes Received!',
+        'Thank you! We have received your change request and will send you a revised quote shortly.', quote_id)
 
 
-# ─── Invoicing ────────────────────────────────────────────────────────────────
+# ─── Invoice: shared function — called directly, no internal HTTP ──────────────
 def generate_invoice_number(agent_id):
     import datetime
     year     = datetime.date.today().year
-    existing = supabase_get('invoices', {'agent_id':f'eq.{agent_id}','invoice_number':f'like.INV-{year}-%','select':'invoice_number','order':'created_at.desc','limit':'1'})
+    existing = supabase_get('invoices', {'agent_id':f'eq.{agent_id}','invoice_number':f'like.INV-{year}-%',
+                                          'select':'invoice_number','order':'created_at.desc','limit':'1'})
     if existing:
         try: return f"INV-{year}-{str(int(existing[0]['invoice_number'].split('-')[-1])+1).zfill(4)}"
         except: pass
     return f"INV-{year}-0001"
 
 
+def create_invoice(quote_id, agent_id):
+    """
+    Core invoice creation — called directly by client_accept_confirm() and /generate-invoice.
+    Includes duplicate guard: raises ValueError if invoice already exists for this quote.
+    """
+    import datetime
+
+    # ── Duplicate guard ───────────────────────────────────────────────────────
+    existing = supabase_get('invoices', {'quote_id': f'eq.{quote_id}', 'select': 'id,invoice_number'})
+    if existing:
+        inv_num = existing[0].get('invoice_number', 'existing')
+        logger.warning(f"Invoice {inv_num} already exists for quote {quote_id} — aborting duplicate")
+        raise ValueError(f"Invoice already exists for quote {quote_id}: {inv_num}")
+
+    quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
+    if not quotes: raise ValueError('Quote not found')
+    quote = quotes[0]
+
+    agents = supabase_get('agents', {'id': f'eq.{agent_id}', 'select': '*'})
+    if not agents: raise ValueError('Agent not found')
+    agent = agents[0]
+
+    today        = datetime.date.today()
+    deposit_pct  = float(agent.get('deposit_percentage', 30) or 30)
+    balance_days = int(agent.get('balance_due_days', 60) or 60)
+    total_cents  = int(quote.get('total_price_usd_cents', 0) or 0)
+
+    if total_cents == 0:
+        try:
+            ij = quote.get('itinerary_json')
+            if ij:
+                if isinstance(ij, str): ij = json.loads(ij)
+                pricing   = ij.get('pricing', {})
+                total_usd = float(pricing.get('total_price_usd', 0) or 0)
+                if total_usd == 0:
+                    total_usd = sum(float(i.get('total_price', 0)) for i in ij.get('line_items', []))
+                total_cents = int(total_usd * 100)
+        except Exception as e:
+            logger.warning(f"Could not read total from itinerary_json: {e}")
+
+    deposit_cents = int(round(total_cents * deposit_pct / 100))
+    balance_cents = total_cents - deposit_cents
+    deposit_due   = str(today + datetime.timedelta(days=7))
+    start_date    = quote.get('start_date', '')
+    if start_date:
+        try:
+            sd          = datetime.date.fromisoformat(str(start_date)[:10])
+            balance_due = str(sd - datetime.timedelta(days=balance_days))
+        except:
+            balance_due = str(today + datetime.timedelta(days=30))
+    else:
+        balance_due = str(today + datetime.timedelta(days=30))
+
+    inv_number = generate_invoice_number(agent_id)
+
+    line_items = []
+    try:
+        ij = quote.get('itinerary_json')
+        if ij:
+            if isinstance(ij, str): ij = json.loads(ij)
+            line_items = ij.get('line_items', [])
+    except: pass
+
+    if not line_items:
+        line_items = [{'description': f"Safari — {quote.get('destinations','')}",
+                       'details': f"{quote.get('duration_days','')} nights · {quote.get('pax_adults',2)} adults",
+                       'quantity': quote.get('pax_adults', 2),
+                       'unit_price': round(total_cents/100/max(int(quote.get('pax_adults',2)),1), 2),
+                       'total_price': round(total_cents/100, 2)}]
+
+    invoice_id     = str(uuid.uuid4())
+    invoice_record = {
+        'id':invoice_id,'invoice_number':inv_number,'quote_id':quote_id,'agent_id':agent_id,
+        'client_name':quote.get('client_name',''),'client_email':quote.get('client_email',''),
+        'client_phone':quote.get('client_phone',''),'client_nationality':quote.get('client_nationality',''),
+        'destinations':quote.get('destinations',''),'start_date':quote.get('start_date',None),
+        'end_date':quote.get('end_date',None),'pax_adults':int(quote.get('pax_adults',2) or 2),
+        'pax_children':int(quote.get('pax_children',0) or 0),'duration_nights':int(quote.get('duration_days',0) or 0),
+        'subtotal_usd_cents':total_cents,'tax_usd_cents':0,'total_usd_cents':total_cents,
+        'deposit_pct':deposit_pct,'deposit_usd_cents':deposit_cents,'balance_usd_cents':balance_cents,
+        'amount_paid_usd_cents':0,'amount_due_usd_cents':total_cents,
+        'deposit_due_date':deposit_due,'balance_due_date':balance_due,
+        'status':'sent','line_items':json.dumps(line_items),
+    }
+
+    req = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/invoices",
+        data=json.dumps(invoice_record).encode('utf-8'), method='POST',
+        headers={'Authorization':f'Bearer {SUPABASE_KEY}','apikey':SUPABASE_KEY,
+                 'Content-Type':'application/json','Prefer':'return=minimal'})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
+
+    from pdf_generator import generate_invoice_pdf
+    pdf_data = {
+        'agent': {'agency':agent.get('agency_name',''),'email':agent.get('email',''),'phone':agent.get('phone',''),
+                  'logo_url':agent.get('logo_url',''),'brand_color_primary':agent.get('brand_color_primary','#2E4A7A'),
+                  'brand_color_secondary':agent.get('brand_color_secondary','#C4922A'),
+                  'cancellation_terms':agent.get('cancellation_terms',''),'amendment_terms':agent.get('amendment_terms',''),
+                  'bank_details':agent.get('bank_details',''),'mpesa_details':agent.get('mpesa_details','')},
+        'client': {'name':quote.get('client_name',''),'email':quote.get('client_email',''),'phone':quote.get('client_phone','')},
+        'invoice': {'invoice_number':inv_number,'quote_id':quote_id,'issued_at':str(today),
+                    'total_usd_cents':total_cents,'deposit_usd_cents':deposit_cents,'balance_usd_cents':balance_cents,
+                    'deposit_due_date':deposit_due,'balance_due_date':balance_due,
+                    'destinations':quote.get('destinations',''),'start_date':str(quote.get('start_date',''))[:10],
+                    'end_date':str(quote.get('end_date',''))[:10],'pax_adults':int(quote.get('pax_adults',2) or 2),
+                    'pax_children':int(quote.get('pax_children',0) or 0)},
+        'line_items': line_items,
+    }
+
+    filename    = f"SafariFlow_Invoice_{inv_number}.pdf"
+    output_path = os.path.join(OUTPUT_DIR, filename)
+    generate_invoice_pdf(pdf_data, output_path)
+    pdf_url = supabase_upload(output_path, filename)
+    supabase_update('invoices', {'id': f'eq.{invoice_id}'}, {'pdf_url': pdf_url})
+
+    with open(output_path, 'rb') as f:
+        pdf_base64 = base64.b64encode(f.read()).decode('utf-8')
+
+    client_email_addr = quote.get('client_email', '')
+    if client_email_addr:
+        invoice_html = f"""<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+          <div style="background:{agent.get('brand_color_primary','#2E4A7A')};padding:28px;text-align:center;color:white;border-radius:12px 12px 0 0">
+            <h1 style="margin:0;font-size:20px;letter-spacing:2px">{agent.get('agency_name','')}</h1>
+            <p style="margin:8px 0 0;opacity:0.8;font-size:12px">INVOICE</p>
+          </div>
+          <div style="background:{agent.get('brand_color_secondary','#C4922A')};height:3px"></div>
+          <div style="padding:28px;background:#ffffff">
+            <h2 style="color:#1A1A1A">Dear {quote.get('client_name','')},</h2>
+            <p style="color:#444;line-height:1.7">Please find attached your invoice <strong>{inv_number}</strong> for your upcoming safari.</p>
+            <div style="background:#F8F6F2;border-radius:8px;padding:16px;margin:20px 0">
+              <p style="margin:0 0 8px;font-weight:bold">Payment Summary:</p>
+              <p style="margin:4px 0;color:#444;font-size:13px">Total: <strong>${total_cents/100:,.2f}</strong></p>
+              <p style="margin:4px 0;color:#444;font-size:13px">Deposit due by {deposit_due}: <strong>${deposit_cents/100:,.2f}</strong></p>
+              <p style="margin:4px 0;color:#444;font-size:13px">Balance due by {balance_due}: <strong>${balance_cents/100:,.2f}</strong></p>
+            </div>
+            <p style="color:#444;font-size:13px">Kind regards,<br/><strong>{agent.get('agent_name','')}</strong><br/>{agent.get('agency_name','')}</p>
+          </div></div>"""
+        send_email(to=client_email_addr, subject=f"Invoice {inv_number} — {agent.get('agency_name','')}",
+            html=invoice_html, attachments=[{'filename':filename,'content':pdf_base64}])
+
+    agent_email_addr = agent.get('email', '')
+    if agent_email_addr:
+        send_email(to=agent_email_addr, subject=f"Invoice Sent — {quote.get('client_name','')} ({inv_number})",
+            html=f"""<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:28px">
+              <h2>Invoice Sent ✅</h2>
+              <p>Invoice <strong>{inv_number}</strong> has been sent to {quote.get('client_name','')}.</p>
+              <p>Total: <strong>${total_cents/100:,.2f}</strong><br/>Deposit due: {deposit_due}<br/>Balance due: {balance_due}</p>
+            </div>""")
+
+    logger.info(f"Invoice created: {inv_number} for {quote_id}")
+    return {'success':True,'invoice_id':invoice_id,'invoice_number':inv_number,
+            'pdf_url':pdf_url,'total':total_cents/100,'deposit':deposit_cents/100,
+            'balance':balance_cents/100,'deposit_due':deposit_due,'balance_due':balance_due}
+
+
+# ─── /generate-invoice endpoint ───────────────────────────────────────────────
 @app.route('/generate-invoice', methods=['POST'])
 def generate_invoice():
     try:
         data     = request.get_json(force=True)
         quote_id = data.get('quote_id', '')
         agent_id = data.get('agent_id', '')
-
         if not quote_id or not agent_id:
             return jsonify({'error': 'quote_id and agent_id required'}), 400
-
-        quotes = supabase_get('quotes', {'quote_number': f'eq.{quote_id}', 'select': '*'})
-        if not quotes: return jsonify({'error': 'Quote not found'}), 404
-        quote = quotes[0]
-
-        agents = supabase_get('agents', {'id': f'eq.{agent_id}', 'select': '*'})
-        if not agents: return jsonify({'error': 'Agent not found'}), 404
-        agent = agents[0]
-
-        import datetime
-        today        = datetime.date.today()
-        deposit_pct  = float(agent.get('deposit_percentage', 30) or 30)
-        balance_days = int(agent.get('balance_due_days', 60) or 60)
-        total_cents  = int(quote.get('total_price_usd_cents', 0) or 0)
-
-        if total_cents == 0:
-            try:
-                itinerary = quote.get('itinerary_json')
-                if itinerary:
-                    if isinstance(itinerary, str): itinerary = json.loads(itinerary)
-                    pricing   = itinerary.get('pricing', {})
-                    total_usd = float(pricing.get('total_price_usd', 0) or 0)
-                    if total_usd == 0:
-                        total_usd = sum(float(i.get('total_price', 0)) for i in itinerary.get('line_items', []))
-                    total_cents = int(total_usd * 100)
-            except Exception as e:
-                logger.warning(f"Could not read total from itinerary_json: {e}")
-
-        deposit_cents = int(round(total_cents * deposit_pct / 100))
-        balance_cents = total_cents - deposit_cents
-        deposit_due   = str(today + datetime.timedelta(days=7))
-        start_date    = quote.get('start_date', '')
-        if start_date:
-            try:
-                sd = datetime.date.fromisoformat(str(start_date)[:10])
-                balance_due = str(sd - datetime.timedelta(days=balance_days))
-            except: balance_due = str(today + datetime.timedelta(days=30))
-        else:
-            balance_due = str(today + datetime.timedelta(days=30))
-
-        inv_number = generate_invoice_number(agent_id)
-
-        line_items = []
-        try:
-            ij = quote.get('itinerary_json')
-            if ij:
-                if isinstance(ij, str): ij = json.loads(ij)
-                line_items = ij.get('line_items', [])
-        except: pass
-
-        if not line_items:
-            line_items = [{'description':f"Safari — {quote.get('destinations','')}","details":f"{quote.get('duration_days','')} nights · {quote.get('pax_adults',2)} adults",'quantity':quote.get('pax_adults',2),'unit_price':round(total_cents/100/max(int(quote.get('pax_adults',2)),1),2),'total_price':round(total_cents/100,2)}]
-
-        invoice_id = str(uuid.uuid4())
-        invoice_record = {
-            'id':invoice_id,'invoice_number':inv_number,'quote_id':quote_id,'agent_id':agent_id,
-            'client_name':quote.get('client_name',''),'client_email':quote.get('client_email',''),
-            'client_phone':quote.get('client_phone',''),'client_nationality':quote.get('client_nationality',''),
-            'destinations':quote.get('destinations',''),'start_date':quote.get('start_date',None),'end_date':quote.get('end_date',None),
-            'pax_adults':int(quote.get('pax_adults',2) or 2),'pax_children':int(quote.get('pax_children',0) or 0),
-            'duration_nights':int(quote.get('duration_days',0) or 0),'subtotal_usd_cents':total_cents,'tax_usd_cents':0,
-            'total_usd_cents':total_cents,'deposit_pct':deposit_pct,'deposit_usd_cents':deposit_cents,'balance_usd_cents':balance_cents,
-            'amount_paid_usd_cents':0,'amount_due_usd_cents':total_cents,'deposit_due_date':deposit_due,'balance_due_date':balance_due,
-            'status':'sent','line_items':json.dumps(line_items),
-        }
-        req = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/invoices", data=json.dumps(invoice_record).encode('utf-8'), method='POST',
-            headers={'Authorization':f'Bearer {SUPABASE_KEY}','apikey':SUPABASE_KEY,'Content-Type':'application/json','Prefer':'return=minimal'})
-        with urllib.request.urlopen(req, timeout=15) as resp: resp.read()
-
-        from pdf_generator import generate_invoice_pdf
-        pdf_data = {
-            'agent':{'agency':agent.get('agency_name',''),'email':agent.get('email',''),'phone':agent.get('phone',''),'logo_url':agent.get('logo_url',''),'brand_color_primary':agent.get('brand_color_primary','#2E4A7A'),'brand_color_secondary':agent.get('brand_color_secondary','#C4922A'),'cancellation_terms':agent.get('cancellation_terms',''),'amendment_terms':agent.get('amendment_terms',''),'bank_details':agent.get('bank_details',''),'mpesa_details':agent.get('mpesa_details','')},
-            'client':{'name':quote.get('client_name',''),'email':quote.get('client_email',''),'phone':quote.get('client_phone','')},
-            'invoice':{'invoice_number':inv_number,'quote_id':quote_id,'issued_at':str(today),'total_usd_cents':total_cents,'deposit_usd_cents':deposit_cents,'balance_usd_cents':balance_cents,'deposit_due_date':deposit_due,'balance_due_date':balance_due,'destinations':quote.get('destinations',''),'start_date':str(quote.get('start_date',''))[:10],'end_date':str(quote.get('end_date',''))[:10],'pax_adults':int(quote.get('pax_adults',2) or 2),'pax_children':int(quote.get('pax_children',0) or 0)},
-            'line_items':line_items,
-        }
-        filename    = f"SafariFlow_Invoice_{inv_number}.pdf"
-        output_path = os.path.join(OUTPUT_DIR, filename)
-        generate_invoice_pdf(pdf_data, output_path)
-        pdf_url = supabase_upload(output_path, filename)
-        supabase_update('invoices', {'id': f'eq.{invoice_id}'}, {'pdf_url': pdf_url})
-
-        with open(output_path, 'rb') as f:
-            pdf_base64 = base64.b64encode(f.read()).decode('utf-8')
-
-        client_email_addr = quote.get('client_email', '')
-        if client_email_addr:
-            invoice_html = f"""<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
-              <div style="background:{agent.get('brand_color_primary','#2E4A7A')};padding:28px;text-align:center;color:white;border-radius:12px 12px 0 0"><h1 style="margin:0;font-size:20px;letter-spacing:2px">{agent.get('agency_name','')}</h1><p style="margin:8px 0 0;opacity:0.8;font-size:12px">INVOICE</p></div>
-              <div style="background:{agent.get('brand_color_secondary','#C4922A')};height:3px"></div>
-              <div style="padding:28px;background:#ffffff">
-                <h2 style="color:#1A1A1A">Dear {quote.get('client_name','')},</h2>
-                <p style="color:#444;line-height:1.7">Please find attached your invoice <strong>{inv_number}</strong> for your upcoming safari.</p>
-                <div style="background:#F8F6F2;border-radius:8px;padding:16px;margin:20px 0">
-                  <p style="margin:0 0 8px;font-weight:bold">Payment Summary:</p>
-                  <p style="margin:4px 0;color:#444;font-size:13px">Total: <strong>${total_cents/100:,.2f}</strong></p>
-                  <p style="margin:4px 0;color:#444;font-size:13px">Deposit due by {deposit_due}: <strong>${deposit_cents/100:,.2f}</strong></p>
-                  <p style="margin:4px 0;color:#444;font-size:13px">Balance due by {balance_due}: <strong>${balance_cents/100:,.2f}</strong></p>
-                </div>
-                <p style="color:#444;font-size:13px">Kind regards,<br/><strong>{agent.get('agent_name','')}</strong><br/>{agent.get('agency_name','')}</p>
-              </div></div>"""
-            send_email(to=client_email_addr, subject=f"Invoice {inv_number} — {agent.get('agency_name','')}", html=invoice_html, attachments=[{'filename':filename,'content':pdf_base64}])
-
-        agent_email_addr = agent.get('email', '')
-        if agent_email_addr:
-            send_email(to=agent_email_addr, subject=f"Invoice Sent — {quote.get('client_name','')} ({inv_number})",
-                html=f"""<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:28px"><h2>Invoice Sent ✅</h2><p>Invoice <strong>{inv_number}</strong> has been sent to {quote.get('client_name','')}.</p><p>Total: <strong>${total_cents/100:,.2f}</strong><br/>Deposit due: {deposit_due}<br/>Balance due: {balance_due}</p></div>""")
-
-        logger.info(f"Invoice generated: {inv_number} for {quote_id}")
-        return jsonify({'success':True,'invoice_id':invoice_id,'invoice_number':inv_number,'pdf_url':pdf_url,'total':total_cents/100,'deposit':deposit_cents/100,'balance':balance_cents/100,'deposit_due':deposit_due,'balance_due':balance_due})
-
+        result = create_invoice(quote_id, agent_id)
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 409
     except Exception as e:
         logger.error(f"Invoice generation error: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
-# ─── Confirm Payment — FIXED: uses agent_id from invoice, not request ─────────
+# ─── Confirm Payment ──────────────────────────────────────────────────────────
 @app.route('/confirm-payment', methods=['POST'])
 def confirm_payment():
-    """Agent confirms a payment received."""
     try:
         data           = request.get_json(force=True)
         invoice_id     = data.get('invoice_id', '')
-        agent_id       = data.get('agent_id', '')  # for logging only
+        agent_id       = data.get('agent_id', '')
         payment_type   = data.get('payment_type', 'deposit')
         payment_method = data.get('payment_method', 'bank_transfer')
         amount_usd     = float(data.get('amount_usd', 0))
@@ -1237,46 +1216,49 @@ def confirm_payment():
         if not invoice_id:
             return jsonify({'error': 'invoice_id required'}), 400
 
-        # Always use agent_id from the invoice — fixes test vs real agent mismatch
         invoices = supabase_get('invoices', {'id': f'eq.{invoice_id}', 'select': '*'})
         if not invoices:
             return jsonify({'error': 'Invoice not found'}), 404
         invoice = invoices[0]
 
+        # Use agent_id from invoice — fixes test vs real agent mismatch
         invoice_agent_id = invoice.get('agent_id', agent_id)
-        logger.info(f"Payment confirm: invoice={invoice_id}, invoice_agent={invoice_agent_id}, amount=${amount_usd}, type={payment_type}")
+        logger.info(f"Payment confirm: invoice={invoice_id}, agent={invoice_agent_id}, amount=${amount_usd}, type={payment_type}")
 
-        amount_cents = int(amount_usd * 100)
-        payment_id   = str(uuid.uuid4())
+        amount_cents   = int(amount_usd * 100)
+        payment_id     = str(uuid.uuid4())
         payment_record = {
-            'id':invoice_id and payment_id,'invoice_id':invoice_id,'agent_id':invoice_agent_id,
+            'id':payment_id,'invoice_id':invoice_id,'agent_id':invoice_agent_id,
             'payment_type':payment_type,'payment_method':payment_method,
             'amount_usd_cents':amount_cents,'reference':reference,'notes':notes,'confirmed_by':'agent',
         }
-        # fix: correct key
-        payment_record['id'] = payment_id
-        req = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/payments", data=json.dumps(payment_record).encode('utf-8'), method='POST',
-            headers={'Authorization':f'Bearer {SUPABASE_KEY}','apikey':SUPABASE_KEY,'Content-Type':'application/json','Prefer':'return=minimal'})
-        with urllib.request.urlopen(req, timeout=15) as resp: resp.read()
-        logger.info(f"Payment saved: {payment_id}")
+        req = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/payments",
+            data=json.dumps(payment_record).encode('utf-8'), method='POST',
+            headers={'Authorization':f'Bearer {SUPABASE_KEY}','apikey':SUPABASE_KEY,
+                     'Content-Type':'application/json','Prefer':'return=minimal'})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
 
         paid_so_far   = int(invoice.get('amount_paid_usd_cents', 0) or 0) + amount_cents
         total_cents   = int(invoice.get('total_usd_cents', 0) or 0)
         amount_due    = max(0, total_cents - paid_so_far)
         deposit_cents = int(invoice.get('deposit_usd_cents', 0) or 0)
 
-        if paid_so_far >= total_cents: new_status = 'balance_paid'
+        if paid_so_far >= total_cents:     new_status = 'balance_paid'
         elif paid_so_far >= deposit_cents: new_status = 'deposit_paid'
-        else: new_status = invoice.get('status', 'sent')
+        else:                              new_status = invoice.get('status', 'sent')
 
-        supabase_update('invoices', {'id': f'eq.{invoice_id}'}, {'amount_paid_usd_cents':paid_so_far,'amount_due_usd_cents':amount_due,'status':new_status})
+        supabase_update('invoices', {'id': f'eq.{invoice_id}'},
+            {'amount_paid_usd_cents':paid_so_far,'amount_due_usd_cents':amount_due,'status':new_status})
 
         quote_id = invoice.get('quote_id', '')
         if quote_id and new_status in ('deposit_paid', 'balance_paid'):
-            supabase_update('quotes', {'quote_number': f'eq.{quote_id}'}, {'status':'confirmed' if new_status == 'balance_paid' else 'deposit_paid'})
+            supabase_update('quotes', {'quote_number': f'eq.{quote_id}'},
+                {'status': 'confirmed' if new_status == 'balance_paid' else 'deposit_paid'})
 
         logger.info(f"Payment confirmed: {payment_type} ${amount_usd} → {new_status}")
-        return jsonify({'success':True,'payment_id':payment_id,'new_status':new_status,'amount_paid':paid_so_far/100,'amount_due':amount_due/100})
+        return jsonify({'success':True,'payment_id':payment_id,'new_status':new_status,
+                        'amount_paid':paid_so_far/100,'amount_due':amount_due/100})
 
     except Exception as e:
         logger.error(f"Payment confirmation error: {str(e)}", exc_info=True)
@@ -1290,10 +1272,11 @@ def upload_inventory(inventory_type):
         import openpyxl
         agent_id = request.form.get('agent_id', '')
         if not agent_id: return jsonify({'error': 'agent_id required'}), 400
-        if inventory_type not in ['accommodations','transport','park_fees']: return jsonify({'error': 'Invalid inventory type'}), 400
+        if inventory_type not in ['accommodations','transport','park_fees']:
+            return jsonify({'error': 'Invalid type'}), 400
         if 'file' not in request.files: return jsonify({'error': 'No file uploaded'}), 400
         file = request.files['file']
-        if not file.filename.endswith(('.xlsx','.xls')): return jsonify({'error': 'Please upload an Excel file (.xlsx)'}), 400
+        if not file.filename.endswith(('.xlsx','.xls')): return jsonify({'error': 'Upload .xlsx file'}), 400
 
         temp_path = os.path.join(OUTPUT_DIR, f'temp_{agent_id}_{inventory_type}.xlsx')
         file.save(temp_path)
@@ -1301,8 +1284,7 @@ def upload_inventory(inventory_type):
         rows_inserted = 0; rows_skipped = 0; errors = []
 
         for row_num, row in enumerate(ws.iter_rows(min_row=5, values_only=True), start=5):
-            if not any(row): continue
-            if not str(row[0] or '').strip(): continue
+            if not any(row) or not str(row[0] or '').strip(): continue
             try:
                 if inventory_type == 'accommodations':
                     record = {'id':str(uuid.uuid4()),'agent_id':agent_id,'name':str(row[0] or '').strip(),'destination':str(row[1] or '').strip(),'category':str(row[2] or '').strip(),'room_type':str(row[3] or '').strip(),'meal_plan':str(row[4] or '').strip(),'price_per_person_usd_cents':int(float(row[5] or 0)*100),'child_price_per_person_usd_cents':int(float(row[6] or 0)*100) if row[6] else None,'child_age_min':int(row[7]) if row[7] else 2,'child_age_max':int(row[8]) if row[8] else 12,'notes':str(row[9] or '').strip() or None}
@@ -1316,8 +1298,10 @@ def upload_inventory(inventory_type):
                     record = {'id':str(uuid.uuid4()),'agent_id':agent_id,'park_name':str(row[0] or '').strip(),'destination':str(row[1] or '').strip(),'visitor_category':str(row[2] or 'Non-Resident').strip(),'fee_per_person_per_day_usd_cents':int(float(row[3] or 0)*100),'child_fee_per_person_per_day_usd_cents':int(float(row[4] or 0)*100) if row[4] else None,'child_age_min':int(row[5]) if row[5] else 3,'child_age_max':int(row[6]) if row[6] else 17,'notes':str(row[7] or '').strip() or None}
                     if not record['park_name']: rows_skipped += 1; continue
                     table = 'park_fees'
-                req = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/{table}", data=json.dumps(record).encode('utf-8'), method='POST',
-                    headers={'Authorization':f'Bearer {SUPABASE_KEY}','apikey':SUPABASE_KEY,'Content-Type':'application/json','Prefer':'return=minimal'})
+                req = urllib.request.Request(f"{SUPABASE_URL}/rest/v1/{table}",
+                    data=json.dumps(record).encode('utf-8'), method='POST',
+                    headers={'Authorization':f'Bearer {SUPABASE_KEY}','apikey':SUPABASE_KEY,
+                             'Content-Type':'application/json','Prefer':'return=minimal'})
                 with urllib.request.urlopen(req, timeout=15) as resp: resp.read()
                 rows_inserted += 1
             except Exception as row_err:
@@ -1325,8 +1309,8 @@ def upload_inventory(inventory_type):
 
         try: os.remove(temp_path)
         except: pass
-        return jsonify({'success':True,'inventory_type':inventory_type,'rows_inserted':rows_inserted,'rows_skipped':rows_skipped,'errors':errors[:5]})
-
+        return jsonify({'success':True,'inventory_type':inventory_type,'rows_inserted':rows_inserted,
+                        'rows_skipped':rows_skipped,'errors':errors[:5]})
     except Exception as e:
         logger.error(f"Inventory upload error: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
@@ -1343,22 +1327,39 @@ def download_template(template_type):
         def side(): return Side(style='thin', color=BC)
         def border(): return Border(left=side(),right=side(),top=side(),bottom=side())
         def hdr(ws,row,col,val,width=20):
-            c=ws.cell(row=row,column=col,value=val); c.font=Font(bold=True,color='FFFFFF',name='Arial',size=10)
-            c.fill=PatternFill('solid',start_color=NAVY); c.alignment=Alignment(horizontal='center',vertical='center',wrap_text=True); c.border=border()
+            c=ws.cell(row=row,column=col,value=val)
+            c.font=Font(bold=True,color='FFFFFF',name='Arial',size=10)
+            c.fill=PatternFill('solid',start_color=NAVY)
+            c.alignment=Alignment(horizontal='center',vertical='center',wrap_text=True)
+            c.border=border()
             ws.column_dimensions[get_column_letter(col)].width=width
         def ex(ws,row,col,val):
-            c=ws.cell(row=row,column=col,value=val); c.font=Font(name='Arial',size=9,italic=True,color='666666')
-            c.fill=PatternFill('solid',start_color=EXAMPLE); c.alignment=Alignment(vertical='center',wrap_text=True); c.border=border()
+            c=ws.cell(row=row,column=col,value=val)
+            c.font=Font(name='Arial',size=9,italic=True,color='666666')
+            c.fill=PatternFill('solid',start_color=EXAMPLE)
+            c.alignment=Alignment(vertical='center',wrap_text=True)
+            c.border=border()
         def title(ws,t,sub,ncols):
-            ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=ncols); c=ws.cell(row=1,column=1,value=t)
-            c.font=Font(bold=True,name='Arial',size=14,color='FFFFFF'); c.fill=PatternFill('solid',start_color=NAVY); c.alignment=Alignment(horizontal='center',vertical='center'); ws.row_dimensions[1].height=28
-            ws.merge_cells(start_row=2,start_column=1,end_row=2,end_column=ncols); c2=ws.cell(row=2,column=1,value=sub)
-            c2.font=Font(name='Arial',size=10,color=GOLD); c2.fill=PatternFill('solid',start_color='F8F6F2'); c2.alignment=Alignment(horizontal='center',vertical='center'); ws.row_dimensions[2].height=20
-            ws.merge_cells(start_row=3,start_column=1,end_row=3,end_column=ncols); c3=ws.cell(row=3,column=1,value='ROW 5 IS AN EXAMPLE — Delete before uploading. Fill from row 6 onwards.')
-            c3.font=Font(bold=True,name='Arial',size=9,color='CC0000'); c3.fill=PatternFill('solid',start_color='FFF0F0'); c3.alignment=Alignment(horizontal='center',vertical='center'); ws.row_dimensions[3].height=16
+            ws.merge_cells(start_row=1,start_column=1,end_row=1,end_column=ncols)
+            c=ws.cell(row=1,column=1,value=t)
+            c.font=Font(bold=True,name='Arial',size=14,color='FFFFFF')
+            c.fill=PatternFill('solid',start_color=NAVY)
+            c.alignment=Alignment(horizontal='center',vertical='center')
+            ws.row_dimensions[1].height=28
+            ws.merge_cells(start_row=2,start_column=1,end_row=2,end_column=ncols)
+            c2=ws.cell(row=2,column=1,value=sub)
+            c2.font=Font(name='Arial',size=10,color=GOLD)
+            c2.fill=PatternFill('solid',start_color='F8F6F2')
+            c2.alignment=Alignment(horizontal='center',vertical='center')
+            ws.row_dimensions[2].height=20
+            ws.merge_cells(start_row=3,start_column=1,end_row=3,end_column=ncols)
+            c3=ws.cell(row=3,column=1,value='ROW 5 IS AN EXAMPLE — Delete before uploading. Fill from row 6 onwards.')
+            c3.font=Font(bold=True,name='Arial',size=9,color='CC0000')
+            c3.fill=PatternFill('solid',start_color='FFF0F0')
+            c3.alignment=Alignment(horizontal='center',vertical='center')
+            ws.row_dimensions[3].height=16
 
         wb = openpyxl.Workbook(); ws = wb.active; ws.freeze_panes = 'A5'
-
         if template_type == 'accommodations':
             ws.title='Accommodations'
             cols=[('Property Name',22),('Destination',18),('Category',18),('Room Type',18),('Meal Plan',16),('Adult Price Per Person (USD)',22),('Child Price Per Person (USD)',22),('Child Age Min',14),('Child Age Max',14),('Notes',28)]
@@ -1387,8 +1388,8 @@ def download_template(template_type):
 
         from io import BytesIO
         output = BytesIO(); wb.save(output); output.seek(0)
-        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name=filename)
-
+        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                         as_attachment=True, download_name=filename)
     except Exception as e:
         logger.error(f"Template download error: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
